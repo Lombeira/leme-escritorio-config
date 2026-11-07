@@ -1,0 +1,2105 @@
+#!/usr/bin/env -S python3 -I
+"""Esteira de agentes da Leme: estado, preview, despachante e pendencias.
+
+Uso:
+  esteira-estado  <KEY> <etapa> <status> [--agente A] [--resumo T] [--reprovado]
+                  [--pr-url U] [--branch B] [--summary S] [--assignee A]
+  esteira-estado  <KEY> --mostrar
+  esteira-preview start <KEY> [--rede] | stop <KEY> | lista
+  esteira despachante        (loop do serviço leme-despachante)
+  esteira pendencias         (uma rodada; chamado pelo leme-pendencias.timer)
+
+Fila (.escritorio/fila/*.json, escrita pelo escritório):
+  {"key", "acao": "triagem"|"aprovar"|"devolver", "por", "comentario", "em"}
+  {"acao": "atualizar_pendencias", "por", "em"}   (sem key; roda o REST na hora)
+
+Só stdlib. Desenho em esteira/DESENHO.md.
+"""
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = HOME / "workspace"
+ESC = ROOT / ".escritorio"
+CARDS = ESC / "cards"
+FILA = ESC / "fila"
+PROCESSADOS = FILA / "processados"
+LOGS = HOME / ".escritorio-logs"
+WORKTREES = ROOT / "repos" / "leme-app" / ".worktrees"
+CONFIG = HOME / ".config" / "leme-escritorio"
+
+HOST_REDE = "192.168.1.173"
+PORTAS = range(5301, 5310)
+PREVIEW_MAX_S = 24 * 3600
+MAX_ATIVOS = 1  # 1 vaga enquanto o QA não fica previsível (06/11/2026); depois volta para 2
+TIMEOUT_EXECUCAO_S = 2 * 3600
+MAX_VOLTAS_QA = 2
+JIRA_ASSIGNEES = {
+    "712020:a024ec0f-673e-4078-b1d0-24d95e1a9157": "glauco",
+    "70121:1c6ec806-32f9-4739-b34e-674ab9d6b852": "feda",
+}
+
+ETAPAS = {"fila", "triagem", "front", "review", "qa", "validacao", "pr", "concluido", "inviavel", "devolvido",
+          "erro"}
+STATUS = {"rodando", "aguardando_humano", "concluido", "falhou"}
+TRANSICOES = {
+    "fila": {"triagem", "erro"},
+    "triagem": {"inviavel", "front", "erro"},
+    "front": {"review", "erro"},  # toda mudança do front passa pelo review
+    "review": {"front", "qa", "erro", "devolvido", "fila"},  # devolvido/fila só se escalado
+    "qa": {"front", "validacao", "erro", "devolvido", "fila"},  # devolvido/fila só se escalado
+    "validacao": {"pr", "devolvido", "erro"},
+    "devolvido": {"front", "erro"},
+    "pr": {"concluido", "erro"},
+    "inviavel": {"fila"},
+    "erro": {"fila", "triagem", "front", "review", "qa", "validacao", "pr"},  # retomar: só o despachante
+    "concluido": {"fila"},
+}
+ETAPAS_RETOMAVEIS = ("triagem", "front", "review", "qa", "validacao", "pr")
+# Revisão de PR de terceiros: só review e validação humana. Sair da validação é do despachante
+# (Publicar no GitHub / não publicar / revisar de novo).
+TRANSICOES_PR = {
+    "fila": {"review", "erro"},
+    "review": {"validacao", "erro"},
+    "validacao": {"concluido", "review", "erro"},
+    "erro": {"review", "fila"},
+    "concluido": {"fila"},
+}
+ETAPAS_ESCALAVEIS = ("review", "qa")  # aguardando_humano nelas = escalado; só sai por devolver ou triagem
+MAX_VOLTAS_REVIEW = 2
+
+
+def etapa_para_retomar(est):
+    """Última etapa de trabalho antes do erro, pelo historico. devolvido volta como front."""
+    for h in reversed(est.get("historico", [])):
+        etapa = h.get("etapa")
+        if etapa == "devolvido":
+            return "front"
+        if etapa in ETAPAS_RETOMAVEIS:
+            return etapa
+    return None
+STATUS_FIXO = {"inviavel": "aguardando_humano", "validacao": "aguardando_humano",
+               "concluido": "concluido", "erro": "falhou"}
+ETAPAS_SEM_EDICAO = {"triagem", "review", "qa"}
+# Aprovação/devolução humana e entrada na fila: só o despachante, ao consumir um pedido da fila.
+RESERVADAS_DESPACHANTE = {("validacao", "pr"), ("validacao", "devolvido"), ("qa", "devolvido"),
+                          ("review", "devolvido")}
+
+ATLASSIAN_LEITURA = [
+    "mcp__atlassian__getJiraIssue", "mcp__atlassian__searchJiraIssuesUsingJql",
+    "mcp__atlassian__getJiraIssueRemoteIssueLinks", "mcp__atlassian__getConfluencePage",
+    "mcp__atlassian__searchConfluenceUsingCql", "mcp__atlassian__fetch",
+    "mcp__atlassian__getAccessibleAtlassianResources", "mcp__atlassian__atlassianUserInfo",
+]
+ATLASSIAN_ESCRITA = [
+    "mcp__atlassian__addCommentToJiraIssue", "mcp__atlassian__addWorklogToJiraIssue",
+    "mcp__atlassian__createConfluenceFooterComment", "mcp__atlassian__createConfluenceInlineComment",
+    "mcp__atlassian__createConfluencePage", "mcp__atlassian__createIssueLink",
+    "mcp__atlassian__createJiraIssue", "mcp__atlassian__editJiraIssue",
+    "mcp__atlassian__transitionJiraIssue", "mcp__atlassian__updateConfluencePage",
+]
+FERRAMENTAS = ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "Agent", "Skill"] + ATLASSIAN_LEITURA
+PROIBIDAS = ATLASSIAN_ESCRITA + ["mcp__amplitude"]
+
+
+# ---------- utilidades ----------
+
+def agora():
+    return int(time.time())
+
+
+def log(msg):
+    LOGS.mkdir(parents=True, exist_ok=True)
+    linha = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    with open(LOGS / "despachante.log", "a", encoding="utf-8") as f:
+        f.write(linha + "\n")
+
+
+def escreve_json(caminho, dados):
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    tmp = caminho.with_name(f".{caminho.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(dados, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, caminho)
+
+
+def le_json(caminho, padrao=None):
+    try:
+        return json.loads(caminho.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return padrao
+
+
+@contextmanager
+def trava(key):
+    d = CARDS / key
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / ".lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def caminho_estado(key):
+    return CARDS / key / "estado.json"
+
+
+def caminho_interno(key):
+    return CARDS / key / ".interno.json"
+
+
+def worktree(key):
+    """Worktree do card. Revisão de PR de outro repo fica em repos/<repo>/.worktrees/<KEY>."""
+    repo = (le_json(caminho_estado(key)) or {}).get("repo")
+    if repo and repo != "leme-app":
+        return ROOT / "repos" / repo / ".worktrees" / key
+    return WORKTREES / key
+
+
+def env_systemd():
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return env
+
+
+def foto_versionados(key):
+    """HEAD + diff dos versionados + git status (pega arquivo NOVO; respeita .gitignore e o
+    info/exclude, onde ficam os artefatos de teste). Usado para provar que triagem/qa não editaram."""
+    wt = worktree(key)
+    if not wt.exists():
+        return None
+    git = ["git", "-C", str(wt)]
+    head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    diff = subprocess.run(git + ["diff", "HEAD"], capture_output=True).stdout
+    status = subprocess.run(git + ["status", "--porcelain=v1", "--untracked-files=all"], capture_output=True).stdout
+    return f"{head}:{hashlib.sha256(diff).hexdigest()}:{hashlib.sha256(status).hexdigest()}"
+
+
+NODE_PADRAO = "24.22.1"  # até o leme-app ter .nvmrc (pendência a); Node 26 quebra a suíte unitária
+FNM_DIR = HOME / ".local" / "share" / "fnm"
+
+
+def versao_node(wt):
+    """Versão de Node do repo (.nvmrc/.node-version); sem arquivo, o padrão da esteira."""
+    for nome in (".nvmrc", ".node-version"):
+        arq = Path(wt) / nome
+        if arq.exists() and arq.read_text().strip():
+            return arq.read_text().strip().lstrip("v")
+    return NODE_PADRAO
+
+
+def bin_node(versao, wt=None):
+    """Instala a versão se faltar (fnm) e garante o pnpm do packageManager nela. Retorna o bin/."""
+    env = {**os.environ, "FNM_DIR": str(FNM_DIR)}
+    fnm = str(HOME / ".local" / "bin" / "fnm")
+    subprocess.run([fnm, "install", versao], env=env, capture_output=True)
+    real = subprocess.run([fnm, "exec", "--using", versao, "node", "--version"], env=env,
+                          capture_output=True, text=True).stdout.strip()
+    bin_dir = FNM_DIR / "node-versions" / real / "installation" / "bin"
+    if not (bin_dir / "pnpm").exists():
+        pnpm = "pnpm@9.12.3"
+        pkg = le_json(Path(wt) / "package.json", {}) if wt else {}
+        if str(pkg.get("packageManager", "")).startswith("pnpm@"):
+            pnpm = pkg["packageManager"].split("+")[0]
+        subprocess.run([str(bin_dir / "npm"), "install", "-g", "--silent", pnpm],
+                       env={**env, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}, capture_output=True)
+    return bin_dir
+
+
+def path_com_node(wt):
+    return f"{bin_node(versao_node(wt), wt)}:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+
+REPO_APP = ROOT / "repos" / "leme-app"
+EXCLUDE_ARTEFATOS = ("test-results/", "playwright-report/")
+
+
+def nome_branch(key, summary):
+    import re
+    import unicodedata
+    ascii_ = unicodedata.normalize("NFKD", summary or "").encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_.lower()).strip("-")
+    if len(slug) > 40:  # corta na última palavra inteira que cabe
+        slug = slug[:41].rsplit("-", 1)[0] if "-" in slug[:41] else slug[:40]
+    return f"{key}-{slug}" if slug else key
+
+
+def cria_env_worktree(wt):
+    """Sem .env o Vite sobe com VITE_APP_LEME_API_URL indefinido e o login do preview dá 404
+    (achado no QA do LM-2680). Copia o .env.example, sem a chave do Amplitude: preview e QA não
+    podem mandar eventos para a analytics da Leme."""
+    env, exemplo = Path(wt) / ".env", Path(wt) / ".env.example"
+    if env.exists() or not exemplo.exists():
+        return
+    linhas = ["VITE_APP_AMPLITUDE_KEY=" if l.startswith("VITE_APP_AMPLITUDE_KEY=") else l
+              for l in exemplo.read_text().splitlines()]
+    env.write_text("# gerado pela esteira a partir do .env.example (sem Amplitude)\n" + "\n".join(linhas) + "\n")
+
+
+def prepara_worktree(key):
+    """Card nasce de origin/main limpa: fetch, worktree novo, exclude dos artefatos e install.
+    Retorna (ok, mensagem). Feito pelo despachante, não pelo modelo."""
+    wt = worktree(key)
+    if wt.exists():
+        return True, f"worktree {wt} já existe, reaproveitado"
+    est = le_json(caminho_estado(key)) or {}
+    branch = nome_branch(key, est.get("summary"))
+    git = ["git", "-C", str(REPO_APP)]
+
+    def roda(cmd, **kw):
+        print("$ " + " ".join(cmd), flush=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+        print(r.stdout + r.stderr, flush=True)
+        return r
+
+    if roda(git + ["fetch", "origin"]).returncode != 0:
+        return False, "git fetch origin falhou"
+    if roda(git + ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]).returncode == 0:
+        return False, f"a branch {branch} já existe sem worktree: decida se apaga ou reaproveita"
+    if roda(git + ["worktree", "add", "-b", branch, str(wt), "origin/main"]).returncode != 0:
+        return False, f"git worktree add falhou para {branch}"
+    comum = Path(subprocess.run(git + ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True).stdout.strip())
+    exclude = comum / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    atual = exclude.read_text() if exclude.exists() else ""
+    faltando = [linha for linha in EXCLUDE_ARTEFATOS if linha not in atual.splitlines()]
+    if faltando:
+        exclude.write_text(atual + ("" if atual.endswith("\n") or not atual else "\n") +
+                           "# artefatos de teste da esteira\n" + "\n".join(faltando) + "\n")
+    cria_env_worktree(wt)
+    env_node = {**os.environ, "PATH": path_com_node(wt)}
+    print(f"node do worktree: {versao_node(wt)}", flush=True)
+    if roda(["pnpm", "install", "--frozen-lockfile"], cwd=wt, timeout=1200, env=env_node).returncode != 0:
+        return False, "pnpm install --frozen-lockfile falhou no worktree"
+    atualiza_campos(key, branch=branch)
+    return True, f"worktree {wt} criado na branch {branch} a partir de origin/main"
+
+
+CONFIG_ESTEIRA = ESC / "config.json"
+
+
+def max_ativos():
+    """Vagas simultâneas, lidas a cada ciclo (mudar não exige reiniciar). Padrão: 2."""
+    try:
+        return max(1, int((le_json(CONFIG_ESTEIRA, {}) or {}).get("max_ativos", 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def manager_vivo(key):
+    """PID do claude -p (ou do preparar-e-rodar) deste card, se ainda estiver rodando."""
+    def e_do_card(cmd):
+        manager = f"Card {key}.".encode() in cmd and b"--agent\0manager" in cmd
+        preparo = b"preparar-e-rodar\0" + key.encode() + b"\0" in cmd
+        return manager or preparo
+
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if d.stat().st_uid != os.getuid():
+                continue
+            cmd = (d / "cmdline").read_bytes()
+            estado = (d / "stat").read_text().split(") ", 1)[1][0]
+        except (OSError, IndexError):
+            continue
+        if estado != "Z" and e_do_card(cmd):
+            return int(d.name)
+    return None
+
+
+class ProcessoAdotado:
+    """Manager que sobreviveu a um reinício do despachante: não é filho, então só dá para observar."""
+
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        try:
+            estado = Path(f"/proc/{self.pid}/stat").read_text().split(") ", 1)[1][0]
+            return None if estado != "Z" else 0
+        except (OSError, IndexError):
+            return 0  # código de saída real não é conhecido; o estado.json diz como terminou
+
+    def wait(self, timeout=None):
+        limite = time.time() + (timeout or 0)
+        while self.poll() is None:
+            if timeout is not None and time.time() > limite:
+                raise subprocess.TimeoutExpired(f"pid {self.pid}", timeout)
+            time.sleep(1)
+        return 0
+
+
+def baixa_anexos(key, limite_mb=25):
+    """Anexos do card no Jira para cards/<KEY>/anexos/ (os agentes não conseguem baixar)."""
+    import re
+    try:
+        anexos = jira_req(f"issue/{key}?fields=attachment")["fields"].get("attachment") or []
+    except Exception as e:
+        return f"não consegui listar os anexos: {e!r}"
+    if not anexos:
+        return "card sem anexos"
+    destino = CARDS / key / "anexos"
+    destino.mkdir(parents=True, exist_ok=True)
+    cfg = le_env(CONFIG / "atlassian.env")
+    auth = base64.b64encode(f"{cfg['ATLASSIAN_EMAIL']}:{cfg['ATLASSIAN_TOKEN']}".encode()).decode()
+    ignorados = set((le_json(caminho_interno(key), {}) or {}).get("anexos_ignorados", []))
+    feitos = []
+    for a in anexos:
+        nome = re.sub(r"[^\w.\- ]", "_", a.get("filename") or a["id"])
+        if nome in ignorados or (a.get("filename") or "") in ignorados:
+            feitos.append(f"{nome} (ignorado: removido pelo humano)")
+            continue
+        alvo = destino / nome
+        if alvo.exists() and alvo.stat().st_size == a.get("size"):
+            feitos.append(f"{nome} (já estava)")
+            continue
+        if (a.get("size") or 0) > limite_mb * 1e6:
+            feitos.append(f"{nome} (pulado: {a['size'] / 1e6:.0f} MB)")
+            continue
+        try:
+            req = urllib.request.Request(a["content"], headers={"Authorization": f"Basic {auth}"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                alvo.write_bytes(r.read())
+            feitos.append(nome)
+        except Exception as e:
+            feitos.append(f"{nome} (falhou: {e!r})")
+    return f"{len(anexos)} anexo(s) em cards/{key}/anexos/: " + ", ".join(feitos)
+
+
+SSH_KEEPALIVE = "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40"
+
+
+def cmd_push(argv):
+    """esteira-push iniciar <KEY> | esperar <KEY> [--max S]
+
+    O push roda como unidade do systemd (sem o limite de 10 min da ferramenta Bash): o pre-push
+    do leme-app roda a suíte inteira (~8 min) com a conexão SSH aberta. 'esperar' bloqueia até
+    --max segundos e sai 0 (branch no origin no HEAD local), 1 (falhou) ou 2 (ainda rodando)."""
+    if len(argv) < 2 or argv[0] not in ("iniciar", "esperar"):
+        print(cmd_push.__doc__, file=sys.stderr)
+        return 2
+    acao, key = argv[0], argv[1]
+    wt, d = worktree(key), CARDS / key
+    est = le_json(caminho_estado(key)) or {}
+    branch = est.get("branch")
+    if not (wt.exists() and branch):
+        print(f"{key}: worktree ou branch ausente", file=sys.stderr)
+        return 1
+    log_push, rc_push, unid = d / "push.log", d / "push.rc", f"leme-push-{key}"
+    git = ["git", "-C", str(wt)]
+
+    if acao == "iniciar":
+        if subprocess.run(["systemctl", "--user", "is-active", "--quiet", unid], env=env_systemd()).returncode == 0:
+            print(f"{key}: push já está rodando")
+            return 0
+        rc_push.unlink(missing_ok=True)
+        cmd = ["systemd-run", "--user", f"--unit={unid}", "--collect", f"--working-directory={wt}",
+               f"--setenv=PATH={path_com_node(wt)}", f"--setenv=GIT_SSH_COMMAND={SSH_KEEPALIVE}",
+               # a trava global de pre-push vale mesmo com o hooksPath local do Husky
+               "--setenv=GIT_CONFIG_COUNT=1", "--setenv=GIT_CONFIG_KEY_0=core.hooksPath",
+               f"--setenv=GIT_CONFIG_VALUE_0={HOME}/.local/share/leme-git-guard",
+               "bash", "-c", 'git push -u origin "$1" > "$2" 2>&1; echo $? > "$3"', "push",
+               branch, str(log_push), str(rc_push)]
+        r = subprocess.run(cmd, env=env_systemd(), capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"{key}: não consegui iniciar o push: {r.stderr.strip()}", file=sys.stderr)
+            return 1
+        print(f"{key}: push de {branch} iniciado (log em {log_push})")
+        return 0
+
+    maximo = int(argv[argv.index("--max") + 1]) if "--max" in argv else 540
+    limite = time.time() + min(maximo, 570)
+    while not rc_push.exists() and time.time() < limite:
+        time.sleep(5)
+    if not rc_push.exists():
+        print(f"{key}: push ainda rodando (a suíte do pre-push demora); rode esperar de novo")
+        return 2
+    rc = rc_push.read_text().strip()
+    head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    remoto = subprocess.run(git + ["ls-remote", "origin", f"refs/heads/{branch}"],
+                            capture_output=True, text=True).stdout.split()
+    cauda = log_push.read_text(errors="replace")[-1500:] if log_push.exists() else ""
+    if rc == "0" and remoto[:1] == [head]:
+        print(f"{key}: push OK, origin/{branch} = {head[:8]}")
+        return 0
+    trava = "TRAVA LEME" in cauda
+    testes = "failed" in cauda.lower() and "Tests" in cauda
+    tipo = "trava" if trava else "testes" if testes else "rede"
+    print(f"{key}: push FALHOU (rc={rc}, tipo={tipo}; no origin: {remoto[:1] or 'nada'}, HEAD {head[:8]})\n{cauda}")
+    return 1
+
+
+def valida_pedido_pr(p):
+    """(ok, motivo, dados). Só PRs da leme-tech; confere o PR no GitHub."""
+    import re
+    key, url, repo, numero = p.get("key"), p.get("url"), p.get("repo"), p.get("numero")
+    try:
+        numero = int(numero)
+    except (TypeError, ValueError):
+        return False, "numero do PR inválido", None
+    if not (isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9._-]+", repo)):
+        return False, "repo inválido", None
+    # PR-<repo>-<n> (não colide entre repos); PR-<n> continua valendo para o leme-app
+    validas = {f"PR-{repo}-{numero}"} | ({f"PR-{numero}"} if repo == "leme-app" else set())
+    if key not in validas:
+        return False, f"key tem que ser PR-{repo}-{numero}", None
+    if url != f"https://github.com/leme-tech/{repo}/pull/{numero}":
+        return False, f"url tem que ser https://github.com/leme-tech/{repo}/pull/{numero} (só leme-tech)", None
+    r = subprocess.run(["gh", "pr", "view", str(numero), "-R", f"leme-tech/{repo}", "--json", "title,author,state"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return False, f"não achei o PR no GitHub: {r.stderr.strip()[:200]}", None
+    info = json.loads(r.stdout)
+    autor = (info.get("author") or {}).get("login", "?")
+    return True, "", {"url": url, "repo": repo, "numero": numero, "summary": f"{info.get('title')} (de @{autor})"}
+
+
+def prepara_worktree_pr(key):
+    """Worktree só para ler o PR: clona o repo se faltar, checkout do PR destacado (sem branch local)."""
+    est = le_json(caminho_estado(key)) or {}
+    repo, numero = est.get("repo"), est.get("numero")
+    repo_dir = ROOT / "repos" / repo
+    if not repo_dir.exists():
+        r = subprocess.run(["git", "clone", "-q", f"git@github.com:leme-tech/{repo}.git", str(repo_dir)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, f"clone de leme-tech/{repo} falhou: {r.stderr.strip()[:200]}"
+    wt = worktree(key)
+    subprocess.run(["git", "-C", str(repo_dir), "fetch", "-q", "origin"], capture_output=True)
+    if not wt.exists():
+        r = subprocess.run(["git", "-C", str(repo_dir), "worktree", "add", "-q", "--detach", str(wt), "origin/HEAD"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, f"git worktree add falhou: {r.stderr.strip()[:200]}"
+    r = subprocess.run(["gh", "pr", "checkout", str(numero), "--detach", "--force"], cwd=wt,
+                       capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        # branch do PR apagada (PR mergeado) ou inacessível: refs/pull/<n>/head sempre existe no GitHub
+        f = subprocess.run(["git", "-C", str(wt), "fetch", "-q", "origin", f"pull/{numero}/head"],
+                           capture_output=True, text=True)
+        c = subprocess.run(["git", "-C", str(wt), "checkout", "-q", "--detach", "FETCH_HEAD"],
+                           capture_output=True, text=True) if f.returncode == 0 else f
+        if c.returncode != 0:
+            return False, f"gh pr checkout e pull/{numero}/head falharam: {(r.stderr or c.stderr).strip()[:200]}"
+    base = subprocess.run(["gh", "pr", "view", str(numero), "--json", "baseRefName", "--jq", ".baseRefName"], cwd=wt,
+                          capture_output=True, text=True).stdout.strip() or "main"
+    subprocess.run(["git", "-C", str(wt), "fetch", "-q", "origin", base], capture_output=True)
+    head = subprocess.run(["git", "-C", str(wt), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    atualiza_campos(key, base=base, branch=f"PR #{numero} (destacado em {head})")
+    return True, f"PR #{numero} de leme-tech/{repo} em {wt} (HEAD {head}, base origin/{base})"
+
+
+def linhas_comentaveis(repo, numero):
+    """{arquivo: {"RIGHT": {linhas}, "LEFT": {linhas}}} do diff que o próprio GitHub mostra no PR.
+    É o que a API aceita para comentário inline (linha do hunk, inclusive contexto)."""
+    import re
+    r = subprocess.run(["gh", "api", "--paginate", f"repos/leme-tech/{repo}/pulls/{numero}/files?per_page=100",
+                        "--jq", ".[] | {filename, patch}"], capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"não consegui ler os arquivos do PR: {r.stderr.strip()[:200]}")
+    mapa = {}
+    for linha_json in r.stdout.splitlines():
+        if not linha_json.strip():
+            continue
+        f = json.loads(linha_json)
+        lados = mapa.setdefault(f["filename"], {"RIGHT": set(), "LEFT": set()})
+        esq = dir_ = 0
+        for l in (f.get("patch") or "").splitlines():
+            m = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", l)
+            if m:
+                esq, dir_ = int(m.group(1)), int(m.group(2))
+                continue
+            if l.startswith("+"):
+                lados["RIGHT"].add(dir_); dir_ += 1
+            elif l.startswith("-"):
+                lados["LEFT"].add(esq); esq += 1
+            elif not l.startswith("\\"):
+                lados["RIGHT"].add(dir_); lados["LEFT"].add(esq); dir_ += 1; esq += 1
+    return mapa
+
+
+def separa_por_diff(comentarios, mapa):
+    """(aceitos, recusados) conforme a linha existe no diff do PR, do lado pedido."""
+    aceitos, recusados = [], []
+    for c in comentarios:
+        lado = c.get("lado", "RIGHT")
+        try:
+            linha = int(c.get("linha"))
+        except (TypeError, ValueError):
+            linha = None
+        if linha and lado in ("RIGHT", "LEFT") and linha in mapa.get(c.get("arquivo"), {}).get(lado, set()):
+            aceitos.append({**c, "linha": linha, "lado": lado})
+        else:
+            recusados.append(c)
+    return aceitos, recusados
+
+
+def valida_achados(key):
+    """Fim do review: achado com linha fora do diff sai do achados.json e vira texto no review.md."""
+    est = le_json(caminho_estado(key)) or {}
+    arq = CARDS / key / "achados.json"
+    achados = le_json(arq)
+    if not isinstance(achados, list):
+        return "sem achados.json"
+    aceitos, fora = separa_por_diff(achados, linhas_comentaveis(est["repo"], est["numero"]))
+    if fora:
+        escreve_json(arq, aceitos)
+        texto = "\n".join(f"- [{a.get('severidade', '?')}] `{a.get('arquivo')}:{a.get('linha')}`: {a.get('texto', '').strip()}"
+                          for a in fora)
+        with open(CARDS / key / "review.md", "a", encoding="utf-8") as f:
+            f.write(f"\n\n## Comentários sem linha no diff do PR (não vão inline)\n\n{texto}\n")
+    return f"{len(aceitos)} inline, {len(fora)} movidos para o review.md"
+
+
+def publica_review_pr(key, comentarios=None, resumo=""):
+    """Posta UM review no PR: event COMMENT, body = resumo exato, comments = textos exatos do humano.
+    Linhas fora do diff ficam de fora e voltam listadas. Retorna (ok, url ou motivo, recusados)."""
+    import tempfile
+    est = le_json(caminho_estado(key)) or {}
+    comentarios = comentarios or []
+    for c in comentarios:
+        if not (isinstance(c, dict) and isinstance(c.get("arquivo"), str) and isinstance(c.get("texto"), str)
+                and c["texto"].strip()):
+            return False, f"comentário inválido no pedido: {str(c)[:120]}", []
+    try:
+        aceitos, recusados = separa_por_diff(comentarios, linhas_comentaveis(est["repo"], est["numero"]))
+    except RuntimeError as e:
+        return False, str(e), []
+
+    def posta(lista):
+        corpo = {"event": "COMMENT", "body": resumo or "",
+                 "comments": [{"path": c["arquivo"], "line": c["linha"], "side": c["lado"], "body": c["texto"]}
+                              for c in lista]}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as t:
+            json.dump(corpo, t)
+        try:
+            return subprocess.run(["gh", "api", f"repos/leme-tech/{est['repo']}/pulls/{est['numero']}/reviews",
+                                   "--method", "POST", "--input", t.name], capture_output=True, text=True, timeout=120)
+        finally:
+            os.unlink(t.name)
+
+    if not aceitos and not (resumo or "").strip():
+        return False, "nada para publicar: nenhum comentário dentro do diff e resumo vazio", recusados
+    r = posta(aceitos)
+    if r.returncode != 0 and aceitos and "422" in (r.stderr + r.stdout):
+        recusados, aceitos = recusados + aceitos, []  # o GitHub recusou mesmo assim: só o resumo
+        if (resumo or "").strip():
+            r = posta([])
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout).strip()[:300], recusados
+    return True, json.loads(r.stdout).get("html_url") or est.get("pr_url"), recusados
+
+
+def cmd_preparar_e_rodar(argv):
+    """Roda no processo filho do despachante: prepara o worktree (triagem) e vira o claude -p."""
+    key, acao, prompt = argv[0], argv[1], argv[2]
+    revisao_pr = (le_json(caminho_estado(key)) or {}).get("tipo") == "revisao_pr"
+    if acao in ("triagem", "retomar", "devolver") and not revisao_pr:
+        print(f"anexos: {baixa_anexos(key)}", flush=True)
+    if revisao_pr and acao in ("revisar_pr", "retomar"):
+        ok, msg = prepara_worktree_pr(key)
+        print(f"preparo do PR: {msg}", flush=True)
+        if not ok:
+            transiciona(key, "erro", "falhou", resumo=f"preparo do worktree do PR: {msg}")
+            return 1
+    elif acao in ("triagem", "retomar"):  # retomar reaproveita o worktree; só recria se sumiu
+        ok, msg = prepara_worktree(key)
+        print(f"preparo: {msg}", flush=True)
+        if not ok:
+            transiciona(key, "erro", "falhou", resumo=f"preparo do worktree: {msg}")
+            return 1
+    if worktree(key).exists():  # Node do worktree para tudo que o manager rodar (inclusive o pre-push)
+        os.environ["PATH"] = path_com_node(worktree(key))
+    cmd = ["claude", "-p", "--agent", "manager", "--permission-mode", "acceptEdits",
+           "--allowedTools", ",".join(FERRAMENTAS), "--disallowedTools", ",".join(PROIBIDAS),
+           "--output-format", "stream-json", "--verbose", prompt]
+    os.execvp(cmd[0], cmd)
+
+
+# ---------- estado ----------
+
+def estado_novo(key, summary="", assignee=""):
+    return {"key": key, "summary": summary, "assignee": assignee, "etapa": "fila", "status": "rodando",
+            "agente": None, "voltas_qa": 0, "voltas_review": 0, "preview_url": None, "pr_url": None, "branch": None,
+            "resumo": "", "historico": [], "atualizado": agora()}
+
+
+class TransicaoInvalida(Exception):
+    pass
+
+
+def transiciona(key, etapa, status, agente=None, resumo=None, reprovado=False, pr_url=None,
+                branch=None, summary=None, assignee=None, por_despachante=False, com_achados=False, tipo=None):
+    if etapa not in ETAPAS:
+        raise TransicaoInvalida(f"etapa desconhecida: {etapa}")
+    if status not in STATUS:
+        raise TransicaoInvalida(f"status desconhecido: {status}")
+    if etapa in STATUS_FIXO and status != STATUS_FIXO[etapa]:
+        raise TransicaoInvalida(f"etapa {etapa} exige status {STATUS_FIXO[etapa]}")
+
+    with trava(key):
+        est = le_json(caminho_estado(key))
+        interno = le_json(caminho_interno(key), {})
+        if est is None:
+            if etapa != "fila":
+                raise TransicaoInvalida(f"card {key} não existe na esteira")
+            est = estado_novo(key)
+            if tipo:
+                est["tipo"] = tipo
+        anterior = est["etapa"]
+        revisao_pr = est.get("tipo") == "revisao_pr"
+
+        tabela = TRANSICOES_PR if revisao_pr else TRANSICOES
+        if etapa != anterior and etapa not in tabela.get(anterior, set()):
+            raise TransicaoInvalida(f"transição {anterior} -> {etapa} não permitida"
+                                    + (" (revisão de PR)" if revisao_pr else ""))
+        sai_do_erro = anterior == "erro" and etapa != "erro"
+        reservada = (anterior, etapa) in RESERVADAS_DESPACHANTE or (revisao_pr and anterior == "validacao"
+                                                                     and etapa != "validacao")
+        if not por_despachante and (etapa == "fila" or sai_do_erro or reservada):
+            raise TransicaoInvalida(f"{anterior} -> {etapa} só o despachante faz (pedido humano na fila)")
+
+        # Agentes de triagem e qa não podem alterar arquivos versionados.
+        if anterior in ETAPAS_SEM_EDICAO and etapa != anterior and etapa != "erro":
+            foto = interno.get("foto_versionados")
+            if foto is not None and foto != foto_versionados(key):
+                _aplica(est, "erro", "falhou", None,
+                        f"agente da etapa {anterior} alterou arquivos versionados do worktree", interno)
+                _grava(key, est, interno)
+                raise TransicaoInvalida(f"etapa {anterior} alterou arquivos versionados: card foi para erro")
+
+        escalado = anterior in ETAPAS_ESCALAVEIS and est["status"] == "aguardando_humano"
+        if anterior in ETAPAS_ESCALAVEIS and etapa in ("devolvido", "fila") and not escalado:
+            raise TransicaoInvalida(f"{anterior} -> {etapa} só vale para card escalado ao humano")
+        if escalado and etapa in ("validacao", "front", "qa"):
+            raise TransicaoInvalida("card escalado ao humano: só sai por devolver ou triagem")
+
+        if anterior == "review" and etapa == "front":
+            if not com_achados:
+                raise TransicaoInvalida("review -> front exige --com-achados")
+            if est.get("voltas_review", 0) + 1 > MAX_VOLTAS_REVIEW:
+                raise TransicaoInvalida(
+                    f"limite de {MAX_VOLTAS_REVIEW} voltas do review atingido: com blocker, escale com "
+                    f"'esteira-estado {key} review aguardando_humano --resumo ...'; só com should-fix, siga para qa")
+            est["voltas_review"] = est.get("voltas_review", 0) + 1
+        if etapa in ("devolvido", "fila"):
+            est["voltas_review"] = 0
+
+        if anterior == "qa" and etapa == "front":
+            if not reprovado:
+                raise TransicaoInvalida("qa -> front exige --reprovado")
+            if est["voltas_qa"] + 1 > MAX_VOLTAS_QA:
+                raise TransicaoInvalida(
+                    f"limite de {MAX_VOLTAS_QA} voltas do QA atingido: escale com "
+                    f"'esteira-estado {key} qa aguardando_humano --resumo ...'")
+            est["voltas_qa"] += 1
+        if etapa == "devolvido":
+            est["voltas_qa"] = 0
+        if etapa == "fila":
+            est.update(voltas_qa=0, preview_url=None, pr_url=None)
+
+        if etapa in ETAPAS_SEM_EDICAO and etapa != anterior:
+            interno["foto_versionados"] = foto_versionados(key)
+
+        for campo, valor in (("pr_url", pr_url), ("branch", branch), ("summary", summary), ("assignee", assignee)):
+            if valor is not None:
+                est[campo] = valor
+        _aplica(est, etapa, status, agente, resumo, interno)
+        _grava(key, est, interno)
+
+    if anterior == "validacao" and etapa != "validacao":  # pedido de validação fecha quando o card sai dela
+        motivo = {"pr": "aprovado", "devolvido": "devolvido"}.get(etapa, f"card foi para {etapa}")
+        fecha_pedidos(key, motivo)
+    sai_de_preview = (anterior == "validacao" and etapa != "validacao") or \
+                     (anterior == "qa" and etapa not in ("qa", "validacao")) or \
+                     etapa in ("erro", "concluido", "inviavel")
+    if sai_de_preview and preview_ativo(key):
+        preview_stop(key)
+    return est
+
+
+def _aplica(est, etapa, status, agente, resumo, interno):
+    est["etapa"] = etapa
+    est["status"] = status
+    est["agente"] = agente
+    if resumo is not None:
+        est["resumo"] = resumo
+    est["historico"].append({"etapa": etapa, "resultado": status, "resumo": est["resumo"], "em": agora()})
+    est["atualizado"] = agora()
+
+
+def _grava(key, est, interno):
+    escreve_json(caminho_estado(key), est)
+    escreve_json(caminho_interno(key), interno)
+
+
+def atualiza_campos(key, **campos):
+    with trava(key):
+        est = le_json(caminho_estado(key))
+        if est is None:
+            return
+        est.update(campos)
+        est["atualizado"] = agora()
+        escreve_json(caminho_estado(key), est)
+
+
+def cmd_estado(argv):
+    if len(argv) >= 2 and argv[1] == "--mostrar":
+        print(json.dumps(le_json(caminho_estado(argv[0])), ensure_ascii=False, indent=2))
+        return 0
+    if len(argv) < 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    key, etapa, status, resto = argv[0], argv[1], argv[2], argv[3:]
+    opcoes, reprovado, com_achados, i = {}, False, False, 0
+    while i < len(resto):
+        a = resto[i]
+        if a == "--reprovado":
+            reprovado = True
+        elif a == "--com-achados":
+            com_achados = True
+        elif a.startswith("--") and i + 1 < len(resto):
+            opcoes[a[2:].replace("-", "_")] = resto[i + 1]
+            i += 1
+        else:
+            print(f"opção inválida: {a}", file=sys.stderr)
+            return 2
+        i += 1
+    validas = {"agente", "resumo", "pr_url", "branch", "summary", "assignee"}
+    if set(opcoes) - validas:
+        print(f"opções inválidas: {set(opcoes) - validas}", file=sys.stderr)
+        return 2
+    try:
+        est = transiciona(key, etapa, status, reprovado=reprovado, com_achados=com_achados, **opcoes)
+    except TransicaoInvalida as e:
+        print(f"RECUSADO: {e}", file=sys.stderr)
+        return 3
+    print(f"{key}: {est['etapa']} / {est['status']} (voltas_qa={est['voltas_qa']}, "
+          f"voltas_review={est.get('voltas_review', 0)})")
+    return 0
+
+
+# ---------- preview ----------
+
+def unidade(key):
+    return f"leme-preview-{key}"
+
+
+def preview_ativo(key):
+    r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unidade(key)], env=env_systemd())
+    return r.returncode == 0
+
+
+def portas_em_uso():
+    usadas = set()
+    for p in PORTAS:
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", p))
+            except OSError:
+                usadas.add(p)
+    return usadas
+
+
+def preview_start(key, rede):
+    wt = worktree(key)
+    if not (wt / "node_modules" / ".bin" / "vite").exists():
+        raise SystemExit(f"worktree {wt} sem node_modules: rode pnpm install nele antes")
+    if preview_ativo(key):
+        preview_stop(key)
+        time.sleep(1)
+    livres = [p for p in PORTAS if p not in portas_em_uso()]
+    if not livres:
+        raise SystemExit("nenhuma porta livre entre 5301 e 5309")
+    porta = livres[0]
+    host = "0.0.0.0" if rede else "127.0.0.1"
+    cmd = ["systemd-run", "--user", f"--unit={unidade(key)}", "--collect",
+           f"--property=RuntimeMaxSec={PREVIEW_MAX_S}", f"--working-directory={wt}",
+           f"--setenv=PATH={path_com_node(wt)}",
+           "--setenv=VITE_APP_USE_PROD_API=false", "--setenv=BROWSER=none",
+           str(wt / "node_modules" / ".bin" / "vite"), "--host", host, "--port", str(porta), "--strictPort"]
+    subprocess.run(cmd, check=True, env=env_systemd(), capture_output=True)
+    url_local = f"http://127.0.0.1:{porta}/"
+    for _ in range(90):
+        try:
+            urllib.request.urlopen(url_local, timeout=2)
+            break
+        except Exception:
+            time.sleep(1)
+    else:
+        preview_stop(key)
+        raise SystemExit(f"preview de {key} não respondeu em 90 s na porta {porta}")
+    url = f"http://{HOST_REDE}:{porta}/" if rede else url_local
+    atualiza_campos(key, preview_url=url)
+    print(url)
+    return url
+
+
+def preview_stop(key):
+    subprocess.run(["systemctl", "--user", "stop", unidade(key)], env=env_systemd(), capture_output=True)
+    atualiza_campos(key, preview_url=None)
+
+
+def cmd_preview(argv):
+    if argv[:1] == ["lista"]:
+        subprocess.run(["systemctl", "--user", "list-units", "leme-preview-*", "--no-legend"], env=env_systemd())
+        return 0
+    if len(argv) < 2 or argv[0] not in ("start", "stop"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    if argv[0] == "start":
+        preview_start(argv[1], "--rede" in argv[2:])
+    else:
+        preview_stop(argv[1])
+    return 0
+
+
+# ---------- despachante ----------
+
+class Despachante:
+    def __init__(self):
+        self.rodando = {}  # key -> (Popen, inicio, arquivo_log)
+        self.redatores = {}  # id do novo card -> (Popen, inicio, arquivo_log, pasta); fora das vagas dos cards
+
+    def iniciar(self):
+        """Ao subir, adota os managers que continuam vivos (KillMode=process: reiniciar o
+        despachante não mata card em andamento). Só card rodando sem processo vira erro."""
+        for d in (CARDS, FILA, PROCESSADOS, LOGS):
+            d.mkdir(parents=True, exist_ok=True)
+        for est_path in CARDS.glob("*/estado.json"):
+            est = le_json(est_path) or {}
+            key = est.get("key")
+            if est.get("status") != "rodando" or est.get("etapa") == "fila":
+                continue
+            pid = manager_vivo(key)
+            if pid:
+                logs = sorted(LOGS.glob(f"{key}-*.log"), key=lambda p: p.stat().st_mtime)
+                f = open(logs[-1] if logs else os.devnull, "a", encoding="utf-8")
+                inicio = (le_json(caminho_interno(key), {}) or {}).get("inicio") or agora()
+                self.rodando[key] = (ProcessoAdotado(pid), inicio, f)
+                log(f"{key}: manager em andamento adotado (pid {pid})")
+            else:
+                self.para_com_erro(key, "despachante reiniciou e o manager do card não estava mais vivo")
+        log("despachante iniciado")
+
+    def para_com_erro(self, key, motivo):
+        try:
+            transiciona(key, "erro", "falhou", resumo=motivo)
+        except TransicaoInvalida as e:
+            log(f"{key}: não consegui marcar erro ({e})")
+        log(f"{key}: erro: {motivo}")
+
+    def rejeita(self, arq, motivo):
+        destino = PROCESSADOS / f"{agora()}-{arq.name}"
+        os.replace(arq, destino)
+        destino.with_name(destino.name + ".erro").write_text(motivo + "\n", encoding="utf-8")
+        log(f"fila: {arq.name} rejeitado: {motivo}")
+
+    def processa_fila(self):
+        pedidos, atualizar = [], []
+        for arq in FILA.glob("*.json"):
+            dados = le_json(arq)
+            if not isinstance(dados, dict):
+                self.rejeita(arq, "JSON inválido")
+                continue
+            if dados.get("acao") == "atualizar_pendencias":
+                atualizar.append((arq, dados))
+            elif dados.get("acao") in ("limpar", "faxina"):
+                self.limpeza_da_fila(arq, dados)
+            elif dados.get("acao") == "remover_anexo":
+                self.remover_anexo_da_fila(arq, dados)
+            elif dados.get("acao") in ("novo_card", "confirmar_card"):
+                self.novo_card_da_fila(arq, dados)
+            else:
+                pedidos.append((dados.get("em", 0), arq, dados))
+        if atualizar:
+            self.atualiza_pendencias_da_fila(atualizar)
+        for _, arq, p in sorted(pedidos, key=lambda x: x[0]):
+            key, acao, por = p.get("key"), p.get("acao"), p.get("por")
+            if not key or acao not in ("triagem", "aprovar", "devolver", "retomar", "revisar_pr") or \
+                    por not in ("glauco", "feda"):
+                self.rejeita(arq, "campos obrigatórios: key, acao (triagem|aprovar|devolver|retomar|revisar_pr), "
+                                  "por (glauco|feda)")
+                continue
+            est = le_json(caminho_estado(key))
+            ocupado = key in self.rodando
+            extra = {}
+            if acao == "revisar_pr":
+                ok_pr, motivo_pr, dados_pr = valida_pedido_pr(p)
+                if not ok_pr:
+                    self.rejeita(arq, motivo_pr)
+                    continue
+                if est and est.get("tipo") != "revisao_pr":
+                    self.rejeita(arq, f"{key} já é um card do Jira na esteira; use outra chave")
+                    continue
+                if est and est.get("repo") and est["repo"] != dados_pr["repo"]:
+                    self.rejeita(arq, f"{key} já é a revisão de um PR do {est['repo']}; chave repetida entre repos")
+                    continue
+                if ocupado or (est and est["etapa"] not in ("concluido", "erro")):
+                    self.rejeita(arq, f"{key} já está na esteira ({est and est['etapa']})")
+                    continue
+                transiciona(key, "fila", "rodando", resumo="na fila", summary=dados_pr["summary"],
+                            por_despachante=True, tipo="revisao_pr")
+                atualiza_campos(key, tipo="revisao_pr", pr_url=dados_pr["url"], repo=dados_pr["repo"],
+                                numero=dados_pr["numero"], publicado=None)
+                extra = {"foco": p.get("comentario") or ""}
+            elif est and est.get("tipo") == "revisao_pr" and acao in ("aprovar", "devolver"):
+                if ocupado or est["etapa"] != "validacao":
+                    self.rejeita(arq, f"{acao} só vale para revisão de PR em validacao")
+                    continue
+                comentario = (p.get("comentario") or "").strip()
+                if acao == "aprovar":
+                    comentarios = p.get("comentarios") or []
+                    if not isinstance(comentarios, list):
+                        self.rejeita(arq, "comentarios tem que ser uma lista")
+                        continue
+                    ok_pub, msg_pub, recusados = publica_review_pr(key, comentarios, p.get("resumo") or "")
+                    if not ok_pub:
+                        atualiza_campos(key, resumo=f"falha ao publicar no GitHub: {msg_pub}")
+                        self.rejeita(arq, f"não publiquei: {msg_pub}")
+                        continue
+                    n_ok = len(comentarios) - len(recusados)
+                    texto = f"review publicado: {n_ok} comentário(s) inline"
+                    if recusados:
+                        texto += f"; recusados (fora do diff ou pelo GitHub): " + ", ".join(
+                            f"{c.get('arquivo')}:{c.get('linha')}" for c in recusados)
+                    transiciona(key, "concluido", "concluido", resumo=texto, por_despachante=True)
+                    atualiza_campos(key, publicado=True, review_url=msg_pub,
+                                    comentarios_recusados=[{k: c.get(k) for k in ("id", "arquivo", "linha", "lado")}
+                                                           for c in recusados])
+                    log(f"{key}: review publicado por {por} ({msg_pub}); {n_ok} inline, {len(recusados)} recusados")
+                elif comentario.lower().replace("ã", "a") in ("nao publicar", "não publicar"):
+                    transiciona(key, "concluido", "concluido", resumo=f"não publicado (decisão de {por})",
+                                por_despachante=True)
+                    atualiza_campos(key, publicado=False)
+                    log(f"{key}: review não publicado, por {por}")
+                elif not comentario:
+                    self.rejeita(arq, "devolver exige comentario ('não publicar', ou o foco para revisar de novo)")
+                    continue
+                else:  # revisar de novo com o comentário como foco
+                    with trava(key):
+                        interno = le_json(caminho_interno(key), {})
+                        interno["pendente"] = {"acao": "revisar_pr", "por": por, "comentario": comentario,
+                                               "foco": comentario, "em": p.get("em", agora())}
+                        escreve_json(caminho_interno(key), interno)
+                    log(f"fila: {key} revisar de novo por {por} (foco: {comentario[:80]})")
+                os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+                continue
+            elif acao == "retomar":
+                # erro: refaz a última etapa do historico; front/aguardando_humano: o agente parou
+                # pedindo algo (ex.: anexo) e o humano já resolveu.
+                parado_no_front = est and est["etapa"] == "front" and est["status"] == "aguardando_humano"
+                alvo = est and ((est["etapa"] == "erro" and etapa_para_retomar(est)) or (parado_no_front and "front"))
+                if ocupado or not alvo:
+                    self.rejeita(arq, f"retomar só vale para card em erro com etapa anterior conhecida "
+                                      f"({est and est['etapa']})")
+                    continue
+                extra = {"etapa": alvo}
+            elif acao == "triagem":
+                reabrivel = est is None or est["etapa"] in ("inviavel", "erro", "concluido") or \
+                    (est["etapa"] in ETAPAS_ESCALAVEIS and est["status"] == "aguardando_humano")
+                if ocupado or not reabrivel:
+                    self.rejeita(arq, f"{key} já está na esteira ({est and est['etapa']})")
+                    continue
+                info = self.info_pendencia(key)
+                transiciona(key, "fila", "rodando", resumo="na fila", summary=info.get("summary", ""),
+                            assignee=info.get("assignee", ""), por_despachante=True)
+                ok_a, msg_a = atribui_se_vazio(key, por)
+                log(f"{key}: responsável no Jira: {msg_a}")
+                if ok_a and msg_a.startswith("atribuído"):
+                    atualiza_campos(key, assignee=por)
+            else:
+                em_validacao = est and est["etapa"] == "validacao" and est["status"] == "aguardando_humano"
+                escalado = est and est["etapa"] in ETAPAS_ESCALAVEIS and est["status"] == "aguardando_humano"
+                if ocupado or not (em_validacao or (acao == "devolver" and escalado)):
+                    self.rejeita(arq, f"{acao} só vale para card em validacao (ou devolver em card escalado)")
+                    continue
+                if acao == "devolver" and not p.get("comentario"):
+                    self.rejeita(arq, "devolver exige comentario")
+                    continue
+            with trava(key):
+                interno = le_json(caminho_interno(key), {})
+                interno["pendente"] = {"acao": acao, "por": por, "comentario": p.get("comentario") or "",
+                                       "em": p.get("em", agora()), **extra}
+                escreve_json(caminho_interno(key), interno)
+            os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+            log(f"fila: {key} {acao} por {por} aceito")
+
+    def novo_card_da_fila(self, arq, p):
+        acao, nid, por = p.get("acao"), p.get("novo"), p.get("por")
+        if por not in ("glauco", "feda"):
+            return self.rejeita(arq, f"{acao} exige por (glauco|feda)")
+        pasta = pasta_novo(nid)
+        if not pasta:
+            return self.rejeita(arq, f"pasta novos/{nid} não existe ou id inválido")
+        if (pasta / "descartado").exists():
+            return self.rejeita(arq, f"novos/{nid} foi descartado")
+        status = (le_json(pasta / "estado.json", {}) or {}).get("status")
+        if acao == "novo_card":
+            if not (pasta / "pedido.json").exists():
+                return self.rejeita(arq, "pedido.json não existe")
+            if status in ("rascunhando", "criando", "criado") or nid in self.redatores:
+                return self.rejeita(arq, f"novos/{nid} já está em {status}")
+            estado_novo_card(pasta, status="rascunhando", key=None, url=None, motivo=None)
+            self.dispara_redator(nid, pasta)
+        else:
+            if status in ("criando", "criado"):
+                return self.rejeita(arq, f"novos/{nid} já foi criado ({(le_json(pasta / 'estado.json', {}) or {}).get('key')})")
+            if not (pasta / "final.json").exists():
+                return self.rejeita(arq, "confirmar_card exige final.json (o texto revisado pelo humano)")
+            estado_novo_card(pasta, status="criando", motivo=None)
+            ok, campos = cria_card_no_jira(pasta)
+            estado_novo_card(pasta, status="criado" if ok else "erro", **campos)
+            log(f"novo {nid}: {'criado ' + campos['key'] + ' ' + (campos.get('motivo') or '') if ok else 'erro: ' + campos['motivo']}")
+            if ok:
+                ok_p, msg_p = atualiza_pendencias()
+                log(f"novo {nid}: pendências atualizadas ({msg_p})")
+        os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+
+    def dispara_redator(self, nid, pasta):
+        prompt = (f"Novo card {nid}: leia {pasta}/pedido.json e os prints listados nele (na mesma pasta) e escreva "
+                  f"{pasta}/rascunho.json. Siga as instruções do agente redator.")
+        arq_log = LOGS / f"novo-{nid}-{agora()}.log"
+        cmd = ["claude", "-p", "--agent", "redator", "--permission-mode", "acceptEdits",
+               "--allowedTools", "Read,Glob,Grep,Write", "--disallowedTools", ",".join(PROIBIDAS + ["Bash", "Edit"]),
+               "--output-format", "stream-json", "--verbose", prompt]
+        f = open(arq_log, "w", encoding="utf-8")
+        env = env_systemd()
+        env["ESTEIRA_HEADLESS"] = "1"
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
+        self.redatores[nid] = (proc, agora(), f, pasta)
+        log(f"novo {nid}: redator disparado, pid {proc.pid}")
+
+    def colhe_redatores(self):
+        for nid, (proc, inicio, f, pasta) in list(self.redatores.items()):
+            rc = proc.poll()
+            if rc is None and agora() - inicio > TIMEOUT_REDATOR_S:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                rc = "timeout"
+            if rc is None:
+                continue
+            f.close()
+            del self.redatores[nid]
+            r = le_json(pasta / "rascunho.json")
+            campos_ok = isinstance(r, dict) and all(r.get(c) for c in ("titulo", "descricao", "tipo", "responsavel"))
+            if rc == "timeout" or not campos_ok:
+                estado_novo_card(pasta, status="erro", motivo="redator não gerou rascunho válido" + (" (timeout)" if rc == "timeout" else ""))
+            else:
+                estado_novo_card(pasta, status="rascunho", motivo=None)
+            self.registra_custo_redator(nid, Path(f.name))
+            log(f"novo {nid}: redator terminou -> {(le_json(pasta / 'estado.json', {}) or {}).get('status')}")
+
+    def registra_custo_redator(self, nid, arq_log):
+        try:
+            for linha in arq_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                if '"type":"result"' in linha.replace(" ", ""):
+                    r = json.loads(linha)
+                    for modelo, dados in (r.get("modelUsage") or {}).items():
+                        with open(ESC / "custos.jsonl", "a", encoding="utf-8") as c:
+                            c.write(json.dumps({"em": agora(), "card": nid, "execucao": "novo_card", "agente": "redator",
+                                                "setor": "redacao", "modelo": modelo,
+                                                "custo_usd": round(dados.get("costUSD") or 0, 4)}) + "\n")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def remover_anexo_da_fila(self, arq, p):
+        """Apaga um anexo baixado e o põe na lista de ignorados do card. O anexo continua no Jira."""
+        key, nome, por = p.get("key"), p.get("arquivo"), p.get("por")
+        if por not in ("glauco", "feda") or not key or not isinstance(nome, str):
+            return self.rejeita(arq, "remover_anexo exige key, arquivo e por (glauco|feda)")
+        if not nome or "/" in nome or "\\" in nome or ".." in nome or nome.startswith(".") or "\0" in nome:
+            return self.rejeita(arq, f"nome de arquivo inválido: {nome!r} (só nome simples, dentro de anexos/)")
+        est = le_json(caminho_estado(key))
+        if not est:
+            return self.rejeita(arq, f"{key} não existe na esteira")
+        pasta = (CARDS / key / "anexos").resolve()
+        alvo = (pasta / nome).resolve()
+        if alvo.parent != pasta or not alvo.is_file():
+            return self.rejeita(arq, f"anexo {nome!r} não existe em cards/{key}/anexos/")
+        alvo.unlink()
+        with trava(key):
+            interno = le_json(caminho_interno(key), {})
+            ignorados = interno.get("anexos_ignorados", [])
+            if nome not in ignorados:
+                ignorados.append(nome)
+            interno["anexos_ignorados"] = ignorados
+            escreve_json(caminho_interno(key), interno)
+        aviso = ""
+        if key in self.rodando or est.get("status") == "rodando":
+            aviso = " (card rodando: o agente pode já ter lido o arquivo)"
+            atualiza_campos(key, resumo=f"{est.get('resumo', '')} | anexo {nome} removido por {por}{aviso}".strip(" |"))
+        log(f"{key}: anexo {nome} removido por {por}; não volta nos próximos downloads{aviso}")
+        os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+
+    def limpeza_da_fila(self, arq, p):
+        por, acao, key = p.get("por"), p.get("acao"), p.get("key")
+        if por not in ("glauco", "feda"):
+            return self.rejeita(arq, f"{acao} exige por (glauco|feda)")
+        if acao == "limpar":
+            if not key:
+                return self.rejeita(arq, "limpar exige key")
+            if key in self.rodando:
+                return self.rejeita(arq, f"{key} está rodando agora")
+            ok, msg = limpa_card(key, por)
+            if not ok:
+                return self.rejeita(arq, msg)
+            log(f"limpar {key} por {por}: {msg}")
+        else:
+            antes = shutil_disco()
+            removidos, liberado = faxina(por)
+            log(f"faxina por {por}: {len(removidos)} item(ns), {mb(liberado)} liberados "
+                f"(disco livre {mb(antes)} -> {mb(shutil_disco())})")
+            for r in removidos:
+                log(f"  faxina: {r}")
+        os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+
+    def atualiza_pendencias_da_fila(self, pedidos):
+        validos = []
+        for arq, p in pedidos:
+            if p.get("por") not in ("glauco", "feda"):
+                self.rejeita(arq, "atualizar_pendencias exige por (glauco|feda)")
+            else:
+                validos.append(arq)
+        if not validos:
+            return
+        ok, msg = atualiza_pendencias()  # uma vez só, mesmo com vários pedidos no ciclo
+        for arq in validos:
+            if ok:
+                os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+            else:
+                self.rejeita(arq, f"atualizar_pendencias falhou: {msg}")
+        log(f"fila: atualizar_pendencias ({len(validos)} pedido(s)): {msg}")
+
+    def info_pendencia(self, key):
+        for item in (le_json(ESC / "pendencias.json", {}) or {}).get("items", []):
+            if item.get("key") == key:
+                return item
+        return {}
+
+    def agenda(self):
+        maximo = max_ativos()
+        if len(self.rodando) >= maximo:
+            return
+        candidatos = []
+        for interno_path in CARDS.glob("*/.interno.json"):
+            key = interno_path.parent.name
+            pend = (le_json(interno_path, {}) or {}).get("pendente")
+            if pend and key not in self.rodando:
+                candidatos.append((pend["em"], key, pend))
+        for _, key, pend in sorted(candidatos)[: maximo - len(self.rodando)]:
+            self.dispara(key, pend)
+
+    def dispara(self, key, pend):
+        try:
+            if pend["acao"] == "aprovar":
+                transiciona(key, "pr", "rodando", resumo=f"aprovado por {pend['por']}", por_despachante=True)
+            elif pend["acao"] == "devolver":
+                transiciona(key, "devolvido", "rodando", resumo=f"devolvido por {pend['por']}: {pend['comentario']}",
+                            por_despachante=True)
+            elif pend["acao"] == "retomar":
+                transiciona(key, pend["etapa"], "rodando",
+                            resumo=f"retomado por {pend['por']}: refazendo a etapa {pend['etapa']}",
+                            por_despachante=True)
+            elif pend["acao"] == "revisar_pr" and (le_json(caminho_estado(key)) or {}).get("etapa") == "validacao":
+                transiciona(key, "review", "rodando", resumo=f"revisando de novo (foco de {pend['por']})",
+                            por_despachante=True)
+        except TransicaoInvalida as e:
+            log(f"{key}: {pend['acao']} não aplicado: {e}")
+            with trava(key):
+                interno = le_json(caminho_interno(key), {})
+                interno.pop("pendente", None)
+                escreve_json(caminho_interno(key), interno)
+            return
+        with trava(key):
+            interno = le_json(caminho_interno(key), {})
+            interno.pop("pendente", None)
+            escreve_json(caminho_interno(key), interno)
+        etapa_retomada = f" Etapa a refazer: {pend['etapa']} (o card já está nela)." if pend.get("etapa") else ""
+        prompt = (f"Card {key}. Ação: {pend['acao']}.{etapa_retomada} Por: {pend['por']}. "
+                  f"Comentário do humano: {pend['comentario'] or '-'}. "
+                  f"Worktree: {worktree(key)}. Siga as instruções do agente manager.")
+        est_pr = le_json(caminho_estado(key)) or {}
+        if est_pr.get("tipo") == "revisao_pr":
+            prompt += (f" Revisão de PR de terceiros: {est_pr.get('pr_url')} (repo leme-tech/{est_pr.get('repo')}, "
+                       f"PR #{est_pr.get('numero')}). Foco pedido: {pend.get('foco') or '-'}. "
+                       "Siga a seção 'Ação revisar_pr' do manager.")
+        arq_log = LOGS / f"{key}-{agora()}-{pend['acao']}.log"
+        cmd = [sys.executable, "-I", str(Path(__file__).resolve()), "preparar-e-rodar", key, pend["acao"], prompt]
+        f = open(arq_log, "w", encoding="utf-8")
+        env = env_systemd()
+        env["ESTEIRA_HEADLESS"] = "1"  # o guard nega (em vez de perguntar) quando não há humano
+        env["ESTEIRA_CARD"] = key  # o hook de permissão diz ao escritório de qual card é o pedido
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=env)
+        self.rodando[key] = (proc, agora(), f)
+        with trava(key):
+            interno = le_json(caminho_interno(key), {})
+            interno.update(pid=proc.pid, inicio=agora())
+            escreve_json(caminho_interno(key), interno)
+        log(f"{key}: manager disparado ({pend['acao']}), pid {proc.pid}, log {arq_log.name}")
+
+    def colhe(self):
+        for key, (proc, inicio, f) in list(self.rodando.items()):
+            rc = proc.poll()
+            if rc is None and agora() - inicio > TIMEOUT_EXECUCAO_S:
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                rc = "timeout"
+            if rc is None:
+                continue
+            f.close()
+            del self.rodando[key]
+            self.registra_custo(key, Path(f.name))
+            self.copia_aprendizados(key)
+            est = le_json(caminho_estado(key)) or {}
+            if rc == "timeout":
+                self.para_com_erro(key, f"timeout de {TIMEOUT_EXECUCAO_S // 60} min")
+            elif est.get("status") == "rodando":
+                self.para_com_erro(key, f"manager terminou sem fechar a etapa (rc={rc}, etapa {est.get('etapa')})")
+            elif est.get("status") == "falhou" and est.get("etapa") != "erro":
+                # "<etapa> falhou" vira erro, mantendo o motivo: é o que habilita o Retomar no escritório
+                self.para_com_erro(key, f"{est.get('etapa')} falhou: {est.get('resumo')}")
+            else:
+                log(f"{key}: manager terminou (rc={rc}): {est.get('etapa')} / {est.get('status')}")
+            if (le_json(caminho_estado(key)) or {}).get("etapa") == "inviavel":
+                self.comenta_impedimento(key)
+            est_fim = le_json(caminho_estado(key)) or {}
+            if est_fim.get("tipo") == "revisao_pr" and est_fim.get("etapa") == "validacao":
+                try:
+                    log(f"{key}: achados conferidos contra o diff do PR: {valida_achados(key)}")
+                except Exception as e:
+                    log(f"{key}: não consegui conferir os achados: {e!r}")
+
+    def registra_custo(self, key, arq_log):
+        """Custo da execução (evento final do stream-json) e divisão por setor/agente e modelo.
+        Tokens por agente vêm exatos das transcrições; o custo de cada modelo é repartido na
+        proporção dos tokens ponderados por tipo (estimativa; o total fecha com o oficial)."""
+        resultado = None
+        try:
+            for linha in arq_log.read_text(encoding="utf-8", errors="replace").splitlines():
+                if '"type":"result"' in linha.replace(" ", ""):
+                    resultado = json.loads(linha)
+        except (OSError, json.JSONDecodeError):
+            pass
+        if not resultado or resultado.get("total_cost_usd") is None:
+            log(f"{key}: custo da execução não encontrado no log")
+            return
+        custo = resultado["total_cost_usd"]
+        por_agente = custo_por_agente(resultado)
+        execucao = arq_log.stem.rsplit("-", 1)[-1]
+        with open(ESC / "custos.jsonl", "a", encoding="utf-8") as f:
+            for (agente, modelo), valor in por_agente.items():
+                f.write(json.dumps({"em": agora(), "card": key, "execucao": execucao, "agente": agente,
+                                    "setor": SETOR.get(agente, agente), "modelo": modelo,
+                                    "custo_usd": round(valor, 4)}, ensure_ascii=False) + "\n")
+        with trava(key):
+            est = le_json(caminho_estado(key))
+            if est is None:
+                return
+            est["custo_usd"] = round(est.get("custo_usd", 0) + custo, 2)
+            setores = est.get("custo_por_setor", {})
+            for (agente, _), valor in por_agente.items():
+                s = SETOR.get(agente, agente)
+                setores[s] = round(setores.get(s, 0) + valor, 2)
+            est["custo_por_setor"] = setores
+            escreve_json(caminho_estado(key), est)
+        log(f"{key}: custo da execução ${custo:.2f} (total do card ${est['custo_usd']:.2f}) | por setor: "
+            + ", ".join(f"{s} ${v:.2f}" for s, v in sorted(setores.items(), key=lambda x: -x[1])))
+
+    def copia_aprendizados(self, key):
+        """aprendizados-qa.md do card vai para o Obsidian; incorporar no kit é curadoria humana."""
+        arq = CARDS / key / "aprendizados-qa.md"
+        if not arq.exists():
+            return
+        texto = arq.read_text(encoding="utf-8", errors="replace").strip()
+        assinatura = hashlib.sha256(texto.encode()).hexdigest()
+        with trava(key):
+            interno = le_json(caminho_interno(key), {})
+            if interno.get("aprendizados_copiados") == assinatura:
+                return
+            interno["aprendizados_copiados"] = assinatura
+            escreve_json(caminho_interno(key), interno)
+        destino = ROOT / "notes" / "projetos" / "esteira" / "aprendizados-qa.md"
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        cabecalho = "" if destino.exists() else (
+            "# Aprendizados do QA da esteira\n\nCopiado pelo despachante no fim de cada card. "
+            "O que valer para todos vai para `esteira/qa/CONHECIMENTO.md` (curadoria com o Claude interativo).\n")
+        with open(destino, "a", encoding="utf-8") as f:
+            f.write(f"{cabecalho}\n## {key} ({time.strftime('%d/%m/%Y %H:%M')})\n\n{texto}\n")
+        log(f"{key}: aprendizados do QA copiados para notes/projetos/esteira/")
+
+    def sincroniza_jira(self):
+        """A cada ciclo: status do Jira segue a etapa; a cada 5 min, detecta merge dos PRs abertos."""
+        checa_merge = agora() - getattr(self, "ultimo_merge", 0) >= 300
+        if checa_merge:
+            self.ultimo_merge = agora()
+        for est_path in CARDS.glob("*/estado.json"):
+            est = le_json(est_path) or {}
+            key = est.get("key")
+            if not key:
+                continue
+            if checa_merge and est.get("etapa") == "concluido" and est.get("pr_url") and not est.get("merged_em"):
+                quando = pr_mergeado(est["pr_url"])
+                if quando:
+                    atualiza_campos(key, merged_em=quando)
+                    est["merged_em"] = quando
+                    log(f"{key}: PR mergeado em {quando}")
+            interno = le_json(caminho_interno(key), {})
+            if interno.get("flag_por_esteira") and est.get("etapa") not in ("inviavel", "fila", "triagem"):
+                ok, msg = marca_impedimento(key, False)  # a esteira tirou o impedimento que ela mesma pôs
+                log(f"{key}: flag de impedimento no Jira: {msg}")
+                if ok:
+                    with trava(key):
+                        interno = le_json(caminho_interno(key), {})
+                        interno.pop("flag_por_esteira", None)
+                        escreve_json(caminho_interno(key), interno)
+            alvo = status_jira_desejado(est)
+            if alvo is None or interno.get("jira_aplicado") == alvo:
+                continue
+            try:
+                ok, msg = sincroniza_status_jira(key, est)
+            except Exception as e:
+                ok, msg = False, f"falhou: {e!r}"
+            log(f"{key}: Jira {msg}")
+            if ok:
+                with trava(key):
+                    interno = le_json(caminho_interno(key), {})
+                    interno["jira_aplicado"] = alvo
+                    escreve_json(caminho_interno(key), interno)
+
+    def comenta_impedimento(self, key):
+        """Triagem INVIÁVEL: posta o motivo no card do Jira (decisão do Glauco, 06/11/2026: automático).
+        Quem escreve é o despachante com o token REST, nunca o modelo. Uma vez por triagem."""
+        est = le_json(caminho_estado(key)) or {}
+        marca = next((h["em"] for h in reversed(est.get("historico", [])) if h.get("etapa") == "inviavel"), None)
+        with trava(key):
+            interno = le_json(caminho_interno(key), {})
+            if marca is None or interno.get("comentario_inviavel_em") == marca:
+                return
+        ok, msg = comenta_jira(key, impedimento_de(key, est))
+        log(f"{key}: comentário do impedimento no Jira: {msg}")
+        if ok:
+            flag_ok, flag_msg = marca_impedimento(key, True)
+            log(f"{key}: flag de impedimento no Jira: {flag_msg}")
+            with trava(key):
+                interno = le_json(caminho_interno(key), {})
+                interno["comentario_inviavel_em"] = marca
+                if flag_ok:
+                    interno["flag_por_esteira"] = True
+                escreve_json(caminho_interno(key), interno)
+
+    def varre_previews(self):
+        for est_path in CARDS.glob("*/estado.json"):
+            est = le_json(est_path) or {}
+            key = est.get("key")
+            if not key:
+                continue
+            ativo = preview_ativo(key)
+            if ativo and est.get("etapa") not in ("qa", "validacao"):
+                preview_stop(key)
+                log(f"{key}: preview derrubado (etapa {est.get('etapa')})")
+            elif not ativo and est.get("preview_url"):
+                atualiza_campos(key, preview_url=None)
+                log(f"{key}: preview expirou")
+
+    def loop(self):
+        self.iniciar()
+        while True:
+            try:
+                self.processa_fila()
+                self.colhe()
+                self.colhe_redatores()
+                self.agenda()
+                self.varre_previews()
+                self.sincroniza_jira()
+            except Exception as e:  # o loop não pode morrer por um card ruim
+                log(f"erro no ciclo: {e!r}")
+            time.sleep(10)
+
+
+# ---------- custo por setor ----------
+
+SETOR = {"manager": "manager", "triador": "triagem", "front-dev": "front", "reviewer": "review",
+         "review-validator": "review", "qa": "qa"}
+# Peso relativo de cada tipo de token (relação de preço da Anthropic: ler do cache ~0,1x da entrada,
+# escrever no cache 1,25x (5 min) ou 2x (1 h), saída 5x). Só serve para repartir o custo oficial.
+PESO = {"input_tokens": 1.0, "cache_creation_5m": 1.25, "cache_creation_1h": 2.0,
+        "cache_read_input_tokens": 0.1, "output_tokens": 5.0}
+PROJETO_CLAUDE = HOME / ".claude" / "projects" / "-home-leme-workspace"
+
+
+def _tokens_ponderados(usage):
+    cc = usage.get("cache_creation") or {}
+    c5 = cc.get("ephemeral_5m_input_tokens")
+    c1 = cc.get("ephemeral_1h_input_tokens")
+    if c5 is None and c1 is None:
+        c5, c1 = usage.get("cache_creation_input_tokens", 0) or 0, 0
+    return (PESO["input_tokens"] * (usage.get("input_tokens") or 0) + PESO["cache_creation_5m"] * (c5 or 0)
+            + PESO["cache_creation_1h"] * (c1 or 0)
+            + PESO["cache_read_input_tokens"] * (usage.get("cache_read_input_tokens") or 0)
+            + PESO["output_tokens"] * (usage.get("output_tokens") or 0))
+
+
+def _uso_da_transcricao(arq):
+    """{modelo: tokens ponderados} de uma transcrição (última versão de cada mensagem)."""
+    msgs = {}
+    try:
+        for linha in open(arq, encoding="utf-8", errors="replace"):
+            try:
+                e = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            m = e.get("message") if isinstance(e.get("message"), dict) else None
+            if e.get("type") == "assistant" and m and m.get("usage"):
+                msgs[m.get("id")] = (m.get("model"), m["usage"])
+    except OSError:
+        return {}
+    uso = {}
+    for modelo, u in msgs.values():
+        uso[modelo] = uso.get(modelo, 0) + _tokens_ponderados(u)
+    return uso
+
+
+def custo_por_agente(resultado):
+    """{(agente, modelo): custo} repartindo o costUSD de cada modelo pelos agentes da sessão."""
+    sid = resultado.get("session_id")
+    base = PROJETO_CLAUDE / f"{sid}"
+    uso = {("manager", m): t for m, t in _uso_da_transcricao(Path(f"{base}.jsonl")).items()}
+    for meta in sorted((base / "subagents").glob("*.meta.json")):
+        agente = (le_json(meta, {}) or {}).get("agentType") or "?"
+        for m, t in _uso_da_transcricao(meta.with_name(meta.name.replace(".meta.json", ".jsonl"))).items():
+            uso[(agente, m)] = uso.get((agente, m), 0) + t
+    custos = {}
+    for modelo, dados in (resultado.get("modelUsage") or {}).items():
+        total_modelo = dados.get("costUSD") or 0
+        partes = {k: t for k, t in uso.items() if k[1] == modelo}
+        soma = sum(partes.values())
+        if not soma:
+            custos[("manager", modelo)] = custos.get(("manager", modelo), 0) + total_modelo
+            continue
+        for k, t in partes.items():
+            custos[k] = custos.get(k, 0) + total_modelo * t / soma
+    return custos
+
+
+# ---------- limpeza e faxina ----------
+
+ARQUIVO = ESC / "arquivo.jsonl"
+# Nunca tocar: sessão do tmux, arquivos do Claude Code e mensagens entre sessões.
+TMP_PROTEGIDOS = ("tmux-", "claude-", "cc-socks", "tsx-", "systemd-", ".X11-unix", ".ICE-unix", "snap-private")
+
+
+def tamanho(caminho):
+    total = 0
+    for raiz, _, arquivos in os.walk(caminho):
+        for a in arquivos:
+            try:
+                total += os.lstat(os.path.join(raiz, a)).st_size
+            except OSError:
+                pass
+    return total if os.path.isdir(caminho) else (os.lstat(caminho).st_size if os.path.lexists(caminho) else 0)
+
+
+def mais_recente(caminho):
+    """mtime mais recente de tudo dentro (pasta parada no nome mas com arquivo novo dentro não é sobra)."""
+    recente = os.lstat(caminho).st_mtime
+    if os.path.isdir(caminho) and not os.path.islink(caminho):
+        for raiz, dirs, arquivos in os.walk(caminho):
+            for a in dirs + arquivos:
+                try:
+                    recente = max(recente, os.lstat(os.path.join(raiz, a)).st_mtime)
+                except OSError:
+                    pass
+    return recente
+
+
+def remove(caminho):
+    import shutil
+    if os.path.isdir(caminho) and not os.path.islink(caminho):
+        shutil.rmtree(caminho, ignore_errors=True)
+    else:
+        try:
+            os.unlink(caminho)
+        except FileNotFoundError:
+            pass
+
+
+def mb(n):
+    return f"{n / 1e6:.1f} MB"
+
+
+def shutil_disco():
+    import shutil
+    return shutil.disk_usage(str(HOME)).free
+
+
+def worktree_seguro(wt, merged=False):
+    """(ok, motivo). Recusa mudança não commitada ou commit fora do remoto, salvo PR mergeado."""
+    if merged:
+        return True, "PR mergeado"
+    git = ["git", "-C", str(wt)]
+    sujo = subprocess.run(git + ["status", "--porcelain"], capture_output=True, text=True).stdout.strip()
+    if sujo:
+        return False, f"mudança não commitada no worktree: {sujo.splitlines()[0]}" + (" (e mais)" if "\n" in sujo else "")
+    subprocess.run(git + ["fetch", "-q", "origin"], capture_output=True)
+    fora = subprocess.run(git + ["rev-list", "HEAD", "--not", "--remotes=origin"], capture_output=True, text=True).stdout.split()
+    if fora:
+        return False, f"{len(fora)} commit(s) que não estão no remoto (o último é {fora[0][:8]})"
+    return True, "limpo e sem commit local"
+
+
+def pr_mergeado_da_branch(branch):
+    r = subprocess.run(["gh", "pr", "list", "-R", "leme-tech/leme-app", "--head", branch, "--state", "merged",
+                        "--json", "mergedAt", "--jq", ".[0].mergedAt"], capture_output=True, text=True, timeout=60)
+    return r.stdout.strip() or None
+
+
+def remove_worktree(wt):
+    """git worktree remove + apaga a branch LOCAL. Nunca toca a branch remota."""
+    branch = subprocess.run(["git", "-C", str(wt), "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
+    liberado = tamanho(wt)
+    comum = subprocess.run(["git", "-C", str(wt), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True).stdout.strip()
+    repo_dir = Path(comum).parent if comum else REPO_APP  # o repo dono do worktree (leme-app ou outro)
+    r = subprocess.run(["git", "-C", str(repo_dir), "worktree", "remove", "--force", str(wt)], capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, f"git worktree remove falhou: {r.stderr.strip()}", 0
+    if branch:
+        subprocess.run(["git", "-C", str(repo_dir), "branch", "-D", branch], capture_output=True)
+    return True, f"worktree e branch local {branch or '?'} removidos", liberado
+
+
+def fecha_pedidos(key, motivo="limpeza do card"):
+    import re
+    fechados = []
+    for arq in (ROOT / "notes" / "pedidos").glob(f"{key}-*.md"):
+        texto = arq.read_text(encoding="utf-8")
+        novo, n = re.subn(r"(?im)^status:\s*aberto\s*$",
+                          f"status: fechado\nfechado_em: {time.strftime('%Y-%m-%d %H:%M')} ({motivo})", texto, count=1)
+        if n:
+            arq.write_text(novo, encoding="utf-8")
+            fechados.append(arq.name)
+    return fechados
+
+
+def limpa_card(key, por):
+    """Retorna (ok, mensagem). Ordem: preview, worktree, branch local, cards/<KEY>, logs, pedidos."""
+    est = le_json(caminho_estado(key))
+    if not est:
+        return False, f"{key} não existe na esteira"
+    if est["etapa"] not in ("concluido", "inviavel", "erro") or est["status"] == "rodando":
+        return False, f"limpar só vale para card em concluido, inviavel ou erro (está em {est['etapa']}/{est['status']})"
+    wt = worktree(key)
+    if wt.exists():
+        # revisão de PR: worktree só de leitura, destacado, sem commit nosso
+        ok, motivo = worktree_seguro(wt, merged=bool(est.get("merged_em")) or est.get("tipo") == "revisao_pr")
+        if not ok:
+            return False, f"não limpei: {motivo}. Faça push/merge ou descarte à mão antes."
+    concluido_em = next((h["em"] for h in reversed(est.get("historico", [])) if h.get("etapa") == est["etapa"]),
+                        est.get("atualizado"))
+    with open(ARQUIVO, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"key": key, "summary": est.get("summary"), "assignee": est.get("assignee"),
+                            "etapa_final": est["etapa"], "pr_url": est.get("pr_url"), "merged_em": est.get("merged_em"),
+                            "custo_usd": est.get("custo_usd"), "custo_por_setor": est.get("custo_por_setor"),
+                            "concluido_em": concluido_em, "limpo_em": agora(), "por": por}, ensure_ascii=False) + "\n")
+    feito, liberado = [], 0
+    if preview_ativo(key):
+        preview_stop(key)
+        feito.append("preview derrubado")
+    if wt.exists():
+        ok, msg, n = remove_worktree(wt)
+        feito.append(msg)
+        liberado += n
+        if not ok:
+            return False, "; ".join(feito)
+    pasta = CARDS / key
+    liberado += tamanho(pasta)
+    logs = list(LOGS.glob(f"{key}-*.log"))
+    liberado += sum(tamanho(p) for p in logs)
+    remove(pasta)
+    for p in logs:
+        remove(p)
+    feito.append(f"cards/{key} e {len(logs)} log(s) apagados")
+    pedidos = fecha_pedidos(key)
+    if pedidos:
+        feito.append(f"pedidos fechados: {', '.join(pedidos)}")
+    return True, f"{'; '.join(feito)}; {mb(liberado)} liberados"
+
+
+def faxina(por):
+    removidos, liberado = [], 0
+
+    def tira(caminho, motivo):
+        nonlocal liberado
+        n = tamanho(caminho)
+        remove(caminho)
+        liberado += n
+        removidos.append(f"{caminho} ({mb(n)}, {motivo})")
+
+    # 1. worktrees sem card
+    for wt in sorted(WORKTREES.glob("*")) if WORKTREES.exists() else []:
+        if not wt.is_dir() or (CARDS / wt.name / "estado.json").exists():
+            continue
+        branch = subprocess.run(["git", "-C", str(wt), "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
+        ok, motivo = worktree_seguro(wt)
+        if not ok and branch and pr_mergeado_da_branch(branch):
+            ok, motivo = True, "PR mergeado"
+        if not ok:
+            removidos.append(f"MANTIDO {wt}: {motivo}")
+            continue
+        n = tamanho(wt)
+        feito, msg, _ = remove_worktree(wt)
+        if feito:
+            liberado += n
+            removidos.append(f"{wt} ({mb(n)}, worktree sem card: {msg})")
+    # 2. previews sem card em validacao/qa
+    r = subprocess.run(["systemctl", "--user", "list-units", "leme-preview-*", "--no-legend", "--plain"],
+                       capture_output=True, text=True, env=env_systemd())
+    for linha in r.stdout.splitlines():
+        unid = linha.split()[0] if linha.split() else ""
+        key = unid.removeprefix("leme-preview-").removesuffix(".service")
+        etapa = (le_json(caminho_estado(key)) or {}).get("etapa")
+        if unid and etapa not in ("qa", "validacao"):
+            subprocess.run(["systemctl", "--user", "stop", unid], env=env_systemd(), capture_output=True)
+            removidos.append(f"{unid} parado (card em {etapa or 'nenhum'})")
+    # 3. /tmp: playwright e sobras do leme paradas há mais de 1 dia (nunca tmux/claude/sockets)
+    limite_tmp = time.time() - 86400
+    for p in Path("/tmp").iterdir():
+        try:
+            st = p.lstat()
+        except OSError:
+            continue
+        if st.st_uid != os.getuid() or p.name.startswith(TMP_PROTEGIDOS) or p.is_socket():
+            continue
+        if mais_recente(p) < limite_tmp:
+            tira(p, "sobra em /tmp com mais de 1 dia")
+    # 4. logs e processados com mais de 30 dias
+    limite_30 = time.time() - 30 * 86400
+    for p in list(LOGS.glob("*.log")) + list(PROCESSADOS.glob("*")):
+        if p.name != "despachante.log" and p.stat().st_mtime < limite_30:
+            tira(p, "mais de 30 dias")
+    # 5. permissoes/respostas órfãos (o hook espera no máx. 9 min)
+    limite_perm = time.time() - 15 * 60
+    perm_dir, resp_dir = ESC / "permissoes", ESC / "respostas"
+    for p in list(perm_dir.glob("*.json")) + list(resp_dir.glob("*.json")):
+        par = (resp_dir if p.parent == perm_dir else perm_dir) / p.name
+        if p.stat().st_mtime < limite_perm or (p.parent == resp_dir and not par.exists()):
+            tira(p, "permissão órfã")
+    return removidos, liberado
+
+
+# ---------- cards novos (pedidos do Slack, pelo escritório) ----------
+
+NOVOS = ESC / "novos"
+TIPO_ISSUE = {"bug": "10007", "tarefa": "10005"}  # Bug, Tarefa (projeto LM)
+CONTA_JIRA = {nome: conta for conta, nome in JIRA_ASSIGNEES.items()}
+TIMEOUT_REDATOR_S = 15 * 60
+
+
+def pasta_novo(nid):
+    import re
+    if not isinstance(nid, str) or not re.fullmatch(r"n\d{10,16}[0-9a-f]{0,32}", nid):
+        return None
+    p = NOVOS / nid
+    return p if p.is_dir() else None
+
+
+def estado_novo_card(pasta, **campos):
+    atual = le_json(pasta / "estado.json", {}) or {}
+    atual.update(campos)
+    escreve_json(pasta / "estado.json", atual)
+    return atual
+
+
+def _inline_adf(texto):
+    """`código` e **negrito** viram marcas; o resto é texto."""
+    import re
+    nos = []
+    for pedaco in re.split(r"(`[^`]+`|\*\*[^*]+\*\*)", texto):
+        if not pedaco:
+            continue
+        if pedaco.startswith("`") and pedaco.endswith("`") and len(pedaco) > 1:
+            nos.append({"type": "text", "text": pedaco[1:-1], "marks": [{"type": "code"}]})
+        elif pedaco.startswith("**") and pedaco.endswith("**") and len(pedaco) > 4:
+            nos.append({"type": "text", "text": pedaco[2:-2], "marks": [{"type": "strong"}]})
+        else:
+            nos.append({"type": "text", "text": pedaco})
+    return nos
+
+
+def md_para_adf(md):
+    """Markdown simples (títulos, listas, parágrafos, blocos de código) para o formato do Jira (ADF)."""
+    import re
+    blocos, lista, paragrafo, codigo = [], None, [], None
+
+    def fecha_paragrafo():
+        nonlocal paragrafo
+        if paragrafo:
+            blocos.append({"type": "paragraph", "content": _inline_adf(" ".join(paragrafo))})
+            paragrafo = []
+
+    def fecha_lista():
+        nonlocal lista
+        if lista:
+            blocos.append(lista)
+            lista = None
+
+    for linha in md.splitlines():
+        if codigo is not None:
+            if linha.strip().startswith("```"):
+                blocos.append({"type": "codeBlock", "content": [{"type": "text", "text": "\n".join(codigo) or " "}]})
+                codigo = None
+            else:
+                codigo.append(linha)
+            continue
+        if linha.strip().startswith("```"):
+            fecha_paragrafo(); fecha_lista(); codigo = []
+            continue
+        m_titulo = re.match(r"^(#{1,6})\s+(.*)", linha)
+        m_item = re.match(r"^\s*(?:[-*]|(\d+)[.)])\s+(.*)", linha)
+        if m_titulo:
+            fecha_paragrafo(); fecha_lista()
+            blocos.append({"type": "heading", "attrs": {"level": min(len(m_titulo.group(1)) + 1, 6)},
+                           "content": _inline_adf(m_titulo.group(2))})
+        elif m_item:
+            fecha_paragrafo()
+            tipo = "orderedList" if m_item.group(1) else "bulletList"
+            if not lista or lista["type"] != tipo:
+                fecha_lista()
+                lista = {"type": tipo, "content": []}
+            lista["content"].append({"type": "listItem", "content": [
+                {"type": "paragraph", "content": _inline_adf(m_item.group(2)) or [{"type": "text", "text": " "}]}]})
+        elif not linha.strip():
+            fecha_paragrafo(); fecha_lista()
+        else:
+            fecha_lista()
+            paragrafo.append(linha.strip())
+    if codigo is not None:
+        blocos.append({"type": "codeBlock", "content": [{"type": "text", "text": "\n".join(codigo) or " "}]})
+    fecha_paragrafo(); fecha_lista()
+    return {"type": "doc", "version": 1, "content": blocos or [{"type": "paragraph", "content": []}]}
+
+
+def sprint_ativa():
+    r = jira_req("search/jql?" + urllib.parse.urlencode(
+        {"jql": "project = LM AND sprint in openSprints()", "fields": "customfield_10020", "maxResults": "20"}))
+    for issue in r.get("issues", []):
+        for s in issue["fields"].get("customfield_10020") or []:
+            if s.get("state") == "active" and s.get("boardId") == 2:
+                return s["id"]
+    return None
+
+
+def anexa_arquivos(key, arquivos):
+    import mimetypes
+    cfg = le_env(CONFIG / "atlassian.env")
+    auth = base64.b64encode(f"{cfg['ATLASSIAN_EMAIL']}:{cfg['ATLASSIAN_TOKEN']}".encode()).decode()
+    fronteira = f"esteira{secrets_hex()}"
+    corpo = b""
+    for arq in arquivos:
+        tipo = mimetypes.guess_type(arq.name)[0] or "application/octet-stream"
+        corpo += (f"--{fronteira}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{arq.name}\"\r\n"
+                  f"Content-Type: {tipo}\r\n\r\n").encode() + arq.read_bytes() + b"\r\n"
+    corpo += f"--{fronteira}--\r\n".encode()
+    req = urllib.request.Request(f"https://{cfg['ATLASSIAN_SITE']}/rest/api/3/issue/{key}/attachments", data=corpo,
+                                 method="POST", headers={"Authorization": f"Basic {auth}", "X-Atlassian-Token": "no-check",
+                                                         "Content-Type": f"multipart/form-data; boundary={fronteira}"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.status
+
+
+def secrets_hex():
+    import secrets
+    return secrets.token_hex(8)
+
+
+def cria_card_no_jira(pasta):
+    """Cria a issue do final.json confirmado pelo humano. Retorna (ok, campos para o estado.json)."""
+    final = le_json(pasta / "final.json")
+    pedido = le_json(pasta / "pedido.json", {}) or {}
+    if not isinstance(final, dict) or not (final.get("titulo") and final.get("descricao")):
+        return False, {"motivo": "final.json ausente ou sem titulo/descricao"}
+    tipo, resp = final.get("tipo"), final.get("responsavel")
+    if tipo not in TIPO_ISSUE or resp not in CONTA_JIRA:
+        return False, {"motivo": f"tipo ({tipo}) ou responsavel ({resp}) inválido"}
+    titulo = final["titulo"].strip()[:255]
+    label = "backend" if titulo.lower().startswith("[backend]") else "frontend"
+    campos = {"project": {"key": "LM"}, "issuetype": {"id": TIPO_ISSUE[tipo]}, "summary": titulo,
+              "description": md_para_adf(final["descricao"]), "assignee": {"accountId": CONTA_JIRA[resp]},
+              "labels": [label], "priority": {"name": "Medium"}}
+    try:
+        sprint = sprint_ativa()
+        if sprint:
+            campos["customfield_10020"] = sprint
+        criado = jira_req("issue", "POST", {"fields": campos})
+    except Exception as e:
+        return False, {"motivo": f"criação no Jira falhou: {e!r}"}
+    key = criado["key"]
+    cfg = le_env(CONFIG / "atlassian.env")
+    resultado = {"key": key, "url": f"https://{cfg['ATLASSIAN_SITE']}/browse/{key}"}
+    estado_novo_card(pasta, status="criando", **resultado)  # a key fica gravada antes de qualquer outro passo
+    imagens = [pasta / n for n in pedido.get("imagens") or []
+               if isinstance(n, str) and "/" not in n and ".." not in n and (pasta / n).is_file()]
+    if imagens:
+        try:
+            anexa_arquivos(key, imagens)
+            resultado["motivo"] = None
+        except Exception as e:
+            resultado["motivo"] = f"card criado, mas os prints não foram anexados: {e!r}"
+    return True, {**resultado, "sprint": bool(sprint)}
+
+
+# ---------- comentário no Jira ----------
+
+def impedimento_de(key, est):
+    """Tipo, motivo e o que destrava, da seção Impedimento do triagem.md; sem ela, o resumo do estado."""
+    import re
+    campos = {}
+    arq = CARDS / key / "triagem.md"
+    if arq.exists():
+        texto = arq.read_text(encoding="utf-8", errors="replace")
+        for nome, rotulo in (("tipo", "Tipo"), ("motivo", "Motivo"), ("destrava", "O que destrava")):
+            m = re.search(rf"\*\*{rotulo}:\*\*\s*(.+)", texto)
+            if m:
+                campos[nome] = m.group(1).strip().strip("`")
+    if not campos.get("motivo"):
+        campos["motivo"] = est.get("resumo") or "sem motivo registrado"
+    return campos
+
+
+def comenta_jira(key, campos):
+    try:
+        cfg = le_env(CONFIG / "atlassian.env")
+    except FileNotFoundError:
+        return False, "atlassian.env não existe"
+    site, email, token = cfg.get("ATLASSIAN_SITE"), cfg.get("ATLASSIAN_EMAIL"), cfg.get("ATLASSIAN_TOKEN")
+    if not (site and email and token):
+        return False, "atlassian.env incompleto"
+
+    def com_codigo(valor):
+        """Trechos entre crases viram código no Jira (antes apareciam com as crases à mostra)."""
+        nos = []
+        for i, pedaco in enumerate(valor[:1500].replace("\\`", "`").split("`")):
+            if pedaco:
+                nos.append({"type": "text", "text": pedaco, **({"marks": [{"type": "code"}]} if i % 2 else {})})
+        return nos
+
+    def par(rotulo, valor):
+        return {"type": "paragraph", "content": [{"type": "text", "text": f"{rotulo}: ", "marks": [{"type": "strong"}]},
+                                                 *com_codigo(valor)]}
+    blocos = [{"type": "paragraph", "content": [{"type": "text", "text":
+               "🤖 Triagem automática da esteira Leme: este card não pode seguir agora."}]}]
+    if campos.get("tipo"):
+        blocos.append(par("Tipo", campos["tipo"]))
+    blocos.append(par("Motivo", campos["motivo"]))
+    if campos.get("destrava"):
+        blocos.append(par("O que destrava", campos["destrava"]))
+    corpo = json.dumps({"body": {"type": "doc", "version": 1, "content": blocos}}).encode()
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    req = urllib.request.Request(f"https://{site}/rest/api/3/issue/{key}/comment", data=corpo, method="POST",
+                                 headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json",
+                                          "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return True, f"postado (HTTP {r.status})"
+    except Exception as e:
+        return False, f"falhou: {e!r}"
+
+
+# ---------- status no Jira (a esteira reflete a etapa no card) ----------
+
+JIRA_DESENVOLVENDO, JIRA_REVISANDO, JIRA_TESTANDO = "10008", "10007", "10005"
+JIRA_TRANSICAO = {JIRA_DESENVOLVENDO: "71", JIRA_REVISANDO: "61", JIRA_TESTANDO: "41"}
+# Só mexe em card nesses status. Testando, Aguardando Release e Concluído são do time.
+JIRA_GERIDOS = {"10003", JIRA_DESENVOLVENDO, JIRA_REVISANDO}
+JIRA_NOME = {JIRA_DESENVOLVENDO: "Desenvolvendo", JIRA_REVISANDO: "Revisando Código", JIRA_TESTANDO: "Testando"}
+
+
+def status_jira_desejado(est):
+    if est.get("tipo") == "revisao_pr":  # PR-<n> não é card do Jira
+        return None
+    etapa = est.get("etapa")
+    if etapa in ("triagem", "inviavel", "front", "devolvido"):  # triagem já é desenvolvimento; inviável fica com flag
+        return JIRA_DESENVOLVENDO
+    if etapa in ("review", "qa", "validacao", "pr"):
+        return JIRA_REVISANDO
+    if etapa == "concluido" and est.get("pr_url"):
+        return JIRA_TESTANDO if est.get("merged_em") else JIRA_REVISANDO  # PR aberto: revisão humana
+    return None
+
+
+def jira_req(caminho, metodo="GET", corpo=None):
+    cfg = le_env(CONFIG / "atlassian.env")
+    auth = base64.b64encode(f"{cfg['ATLASSIAN_EMAIL']}:{cfg['ATLASSIAN_TOKEN']}".encode()).decode()
+    req = urllib.request.Request(f"https://{cfg['ATLASSIAN_SITE']}/rest/api/3/{caminho}", method=metodo,
+                                 data=json.dumps(corpo).encode() if corpo is not None else None,
+                                 headers={"Authorization": f"Basic {auth}", "Accept": "application/json",
+                                          "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        texto = r.read().decode()
+        return json.loads(texto) if texto else {}
+
+
+def sincroniza_status_jira(key, est):
+    """Leva o card do Jira para o status da etapa. Retorna (aplicou, mensagem)."""
+    alvo = status_jira_desejado(est)
+    if alvo is None:
+        return False, "etapa sem status no Jira"
+    atual = jira_req(f"issue/{key}?fields=status")["fields"]["status"]
+    if atual["id"] == alvo:
+        return True, f"já está em {atual['name']}"
+    if atual["id"] not in JIRA_GERIDOS:
+        return True, f"não mexi: está em {atual['name']} (status do time)"
+    jira_req(f"issue/{key}/transitions", "POST", {"transition": {"id": JIRA_TRANSICAO[alvo]}})
+    return True, f"{atual['name']} -> {JIRA_NOME[alvo]}"
+
+
+JIRA_CAMPO_FLAG = "customfield_10021"  # "Flagged" (valor único "Impediment"): a bandeirinha do board
+
+
+def marca_impedimento(key, ligar):
+    try:
+        jira_req(f"issue/{key}", "PUT", {"fields": {JIRA_CAMPO_FLAG: [{"value": "Impediment"}] if ligar else None}})
+        return True, "marcada" if ligar else "removida"
+    except Exception as e:
+        return False, f"falhou: {e!r}"
+
+
+def atribui_se_vazio(key, por):
+    """Card que entra na esteira sem responsável no Jira fica com quem mandou pelo escritório.
+    Se já tem responsável, não troca. Retorna (ok, mensagem); erro não trava a triagem."""
+    conta = CONTA_JIRA.get(por)
+    if not conta:
+        return False, f"sem accountId para {por}"
+    try:
+        atual = jira_req(f"issue/{key}?fields=assignee")["fields"].get("assignee")
+        if atual:
+            return True, f"mantido {atual.get('displayName')}"
+        jira_req(f"issue/{key}/assignee", "PUT", {"accountId": conta})
+        return True, f"atribuído a {por} (estava sem responsável)"
+    except Exception as e:
+        return False, f"falhou: {e!r}"
+
+
+def pr_mergeado(pr_url):
+    r = subprocess.run(["gh", "pr", "view", pr_url, "--json", "state,mergedAt"], capture_output=True, text=True,
+                       timeout=60)
+    if r.returncode != 0:
+        return None
+    dados = json.loads(r.stdout)
+    return dados.get("mergedAt") if dados.get("state") == "MERGED" else None
+
+
+# ---------- pendencias ----------
+
+def le_env(caminho):
+    dados = {}
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if linha and not linha.startswith("#") and "=" in linha:
+            k, v = linha.split("=", 1)
+            dados[k.strip()] = v.strip()
+    return dados
+
+
+def cmd_pendencias(_argv):
+    ok, msg = atualiza_pendencias()
+    print(msg)
+    return 0 if ok else 1
+
+
+def atualiza_pendencias():
+    """Busca no Jira via REST (sem Claude). Retorna (ok, mensagem). Em falha, o arquivo anterior fica."""
+    try:
+        cfg = le_env(CONFIG / "atlassian.env")
+    except FileNotFoundError:
+        return False, "atlassian.env não existe"
+    site, email, token = cfg.get("ATLASSIAN_SITE"), cfg.get("ATLASSIAN_EMAIL"), cfg.get("ATLASSIAN_TOKEN")
+    if not (site and email and token):
+        log("pendencias: atlassian.env incompleto")
+        return False, "atlassian.env incompleto"
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    ids = ", ".join(f'"{a}"' for a in JIRA_ASSIGNEES)
+    jql = f"assignee in ({ids}) AND statusCategory != Done AND sprint in openSprints() ORDER BY updated DESC"
+    itens, pagina = [], None
+    try:
+        while True:
+            q = {"jql": jql, "fields": "summary,assignee,status,priority,updated", "maxResults": "100"}
+            if pagina:
+                q["nextPageToken"] = pagina
+            req = urllib.request.Request(f"https://{site}/rest/api/3/search/jql?{urllib.parse.urlencode(q)}",
+                                         headers={"Authorization": f"Basic {auth}", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                dados = json.load(r)
+            for i in dados.get("issues", []):
+                f = i["fields"]
+                atualizado = datetime.strptime(f["updated"], "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+                itens.append({
+                    "key": i["key"],
+                    "summary": f.get("summary"),
+                    "assignee": JIRA_ASSIGNEES.get((f.get("assignee") or {}).get("accountId"),
+                                                   (f.get("assignee") or {}).get("displayName")),
+                    "status": (f.get("status") or {}).get("name"),
+                    "priority": (f.get("priority") or {}).get("name"),
+                    "url": f"https://{site}/browse/{i['key']}",
+                    "updated": int(atualizado),
+                })
+            pagina = dados.get("nextPageToken")
+            if not pagina or dados.get("isLast", True):
+                break
+    except Exception as e:
+        log(f"pendencias: falhou, mantive o arquivo anterior: {e!r}")
+        return False, f"REST do Jira falhou: {e!r}"
+    escreve_json(ESC / "pendencias.json", {"updated": agora(), "items": itens})
+    log(f"pendencias: {len(itens)} cards")
+    return True, f"{len(itens)} cards"
+
+
+# ---------- entrada ----------
+
+def main():
+    nome = Path(sys.argv[0]).name
+    argv = sys.argv[1:]
+    if nome == "esteira-estado":
+        return cmd_estado(argv)
+    if nome == "esteira-preview":
+        return cmd_preview(argv)
+    if nome == "esteira-push":
+        return cmd_push(argv)
+    sub = argv[0] if argv else ""
+    if sub == "estado":
+        return cmd_estado(argv[1:])
+    if sub == "preview":
+        return cmd_preview(argv[1:])
+    if sub == "despachante":
+        Despachante().loop()
+        return 0
+    if sub == "preparar-e-rodar":
+        return cmd_preparar_e_rodar(argv[1:])
+    if sub == "pendencias":
+        return cmd_pendencias(argv[1:])
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

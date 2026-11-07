@@ -1,0 +1,7 @@
+{
+  "theme": "dark-ansi",
+  "statusLine": {
+    "type": "command",
+    "command": "/home/leme/.local/bin/leme-statusline"
+  }
+}

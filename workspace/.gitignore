@@ -1,0 +1,19 @@
+# Fora do git do workspace
+repos/
+_import/
+
+# Claude Code: config local da máquina
+.claude/settings.local.json
+
+# Obsidian: versiona só a config compartilhada.
+# Estado local (workspace.json, workspace-mobile.json, cache, plugins) fica fora.
+.obsidian/*
+!.obsidian/app.json
+!.obsidian/appearance.json
+!.obsidian/community-plugins.json
+!.obsidian/core-plugins.json
+.trash/
+
+# Esteira: dados de execução (contrato com o escritório)
+.escritorio/
+__pycache__/

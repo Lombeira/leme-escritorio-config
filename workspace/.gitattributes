@@ -1,0 +1,5 @@
+# Quebra de linha LF em todo lugar (o PC Windows clona este repo).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary

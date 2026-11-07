@@ -1,0 +1,37 @@
+# Memory Index
+
+- [Validar fixes empiricamente](validate-fixes-empirically.md) — provar que funcionou antes de declarar pronto ou escrever em tooling compartilhado
+- [Biome checa arquivos de teste](biome-checks-test-files.md) — `files.ignore` não pega `*.test.tsx`; formate antes de commitar ou o CI quebra
+- [Screenshots são opcionais](screenshots-sao-opcionais.md) — não pedir nem lembrar de anexar prints em PR
+- [Sentry descontinuado](sem-acesso-painel-sentry.md) — não propor usar nem revogar credencial; time não tem acesso ao painel
+- [Tailwind fora de layer por causa do Chakra](tailwind-fora-de-layer-por-causa-do-chakra.md) — utilitário em `@layer` perde para o CSSReset; classe aparece no DOM e não faz nada
+- [Emotion vence Tailwind em componente Chakra](emotion-vence-tailwind-em-componente-chakra.md) — `className` num componente do Chakra é descartado; medir com getComputedStyle
+- [Campo Chakra focado cobre botão sobreposto](campo-chakra-focado-cobre-botao-sobreposto.md) — `zIndex: 1` no foco engole o clique; só clica sem foco
+- [Tooltip centralizado na borda estica o documento](tooltip-centralizado-na-borda-estica-documento.md) — duas barras de scroll na página; usar `top-end`
+- [unspokenPunctuation não pontua em pt-BR](unspoken-punctuation-nao-pontua-pt-br.md) — medido: zero sinais; comparar só pontuação, nunca o texto inteiro
+- [Marcus Perrout saiu da empresa](marcus-perrout-saiu-da-empresa.md) — conta do Jira ainda ativa; card órfão dele se resolve fechando/reatribuindo, não mudando de coluna
+- [Info errada na tela é bug](info-errada-na-tela-e-bug.md) — afirmação falsa é bug mesmo sem a feature existir; ausência de info é melhoria
+- [Código quase sem comentário](codigo-quase-sem-comentario.md) — mirar 8 a 10% de comentário, só armadilha; acima disso o Glauco para para limpar
+- [All Aboard é mensal](all-aboard-e-mensal.md) — deck de tech cobre 30 dias; janela de quinzena já causou retrabalho
+- [Banco de questões é desktop](banco-de-questoes-e-desktop.md) — mobile ali quase não é usado; trade-off de altura em tela pequena não é bloqueio
+- [Glauco valida visual no browser dele](glauco-valida-visual-no-browser-dele.md) — sem Playwright no trabalho interativo (o qa da esteira é exceção); dev server em localhost + ssh -L; suíte só antes do commit
+- [Escopo na URL é para link compartilhado](escopo-na-url-existe-para-link-compartilhado.md) — tirar escola/turma/ano/analytics da query string mata o requisito; quem expulsa pro login preserva `?redirect=`
+- [JQL de status por nome não resolve](jql-status-nome-nao-resolve.md) — `status = "Tarefas pendentes"` dá 0; conferir board pelo ID do status
+- [Fernanda Guerra contribui no leme-app](fernanda-guerra-contribui-no-leme-app.md) — esposa do Glauco; alinhamento sobre PR dela é offline, não por comentário no GitHub
+- [Worker do Vite precisa de ?worker](vite-worker-iife-precisa-query-worker.md) — `new URL()` morre em dev por causa do `format: iife`; fallback silencioso esconde
+- [Conferir o PR antes de novo push](conferir-pr-antes-de-novo-push.md) — PR mergeado no meio do trabalho deixa commit órfão, e o push não reclama
+- [frozen-lockfile é o quinto check](frozen-lockfile-e-o-quinto-check.md) — mexeu no package.json, regenera o lock; os quatro checks locais não pegam
+- [Worktree precisa de install próprio](worktree-precisa-de-install-proprio.md) — node_modules simbolizado mente; branches longas divergem no package.json
+- [Lottie derruba teste de página](lottie-derruba-teste-de-pagina.md) — mocar todo `Animations/*` da árvore; o erro aparece longe da causa
+- [jsdom fica no breakpoint base](jsdom-fica-no-breakpoint-base.md) — teste de página roda sempre na versão celular; mock de matchMedia não muda
+- [Tela que abria só por clique](tela-que-abria-so-por-clique.md) — pôr estado na URL expõe a janela de hidratação; auditar o que roda na montagem
+- [Renomear branch fecha o PR](renomear-branch-fecha-pr.md) — rename de branch com PR aberto fecha o PR; card vai no título, não no nome da branch
+- [Gráficos de exemplo do Amplitude não contam cota](amplitude-graficos-exemplo-nao-contam-cota.md) — apagar os "How many users…" de 2024 não libera espaço
+- [QR link precisa de esquema minúsculo](qr-link-precisa-esquema-minusculo.md) — caixa alta vira texto no celular; segmentar byte+alfanumérico mantém a versão; nada de query string
+- [S3 antes do Textract é load-bearing](s3-no-scan-e-so-auditoria.md) — não inverter a ordem no scan() atual; leitor novo ganha use case próprio
+- [main é homolog](main-e-homolog.md) — produção sai depois de validar em homolog; não propor flag só para proteger a main
+- [Memória guarda aprendizado, não progresso](memoria-guarda-aprendizado-nao-progresso.md) — branch, PR aberto e status de feature não entram; só a lição
+- [pre-push do leme-app](pre-push-do-leme-app.md) — Biome --write + git add . sem commit + suíte inteira; post-commit cria commit [kb]
+- [IDs das integrações](ids-das-integracoes.md) — cloudId do Jira leme-tec; appIds do Amplitude: 616682 prod, 617768 QA/DEV, 900256 Lovable
+- [Hook PermissionRequest na prática](permissionrequest-hook-comportamento.md) — corre em paralelo com o terminal; dispara no claude -p; SESSION_ATTENDED=1/0 separa os modos
+- [leme-app quebra no Node 26](leme-app-suite-quebra-no-node-26.md) — localStorage nativo x jsdom; usar 24 até o PR (c) das pendências

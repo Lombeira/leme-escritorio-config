@@ -1,0 +1,14 @@
+[Unit]
+Description=Despachante da esteira de agentes da Leme
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I %h/workspace/esteira/bin/esteira despachante
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=30
+# Reiniciar o despachante não mata os managers em andamento: o novo processo os adota.
+KillMode=process
+
+[Install]
+WantedBy=default.target

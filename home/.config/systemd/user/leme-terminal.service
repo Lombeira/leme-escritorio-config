@@ -1,0 +1,11 @@
+[Unit]
+Description=Terminal web do leme (ttyd) para o escritorio.casa
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/ttyd -i lo -p 7681 -b /terminal -W -O -t fontSize=14 -t disableLeaveAlert=true /usr/bin/tmux new-session -A -s leme
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

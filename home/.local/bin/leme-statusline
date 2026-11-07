@@ -1,0 +1,27 @@
+#!/usr/bin/env -S python3 -I
+import json, os, sys, time
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    data = {}
+rl = data.get("rate_limits") or {}
+if rl.get("five_hour") or rl.get("seven_day"):
+    out = {"atualizado": time.time(), "five_hour": rl.get("five_hour"), "seven_day": rl.get("seven_day")}
+    path = os.path.expanduser("~/workspace/.escritorio/usage.json")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+parts = []
+model = (data.get("model") or {}).get("display_name")
+if model:
+    parts.append(model)
+for key, label in (("five_hour", "5h"), ("seven_day", "semana")):
+    w = rl.get(key) or {}
+    if isinstance(w.get("used_percentage"), (int, float)):
+        reset = time.strftime("%H:%M", time.localtime(w["resets_at"])) if w.get("resets_at") else ""
+        parts.append(f"{label} {w['used_percentage']:.0f}%" + (f" (reseta {reset})" if reset and key == "five_hour" else ""))
+print(" · ".join(parts))

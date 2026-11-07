@@ -1,0 +1,6 @@
+[Unit]
+Description=Atualiza .escritorio/pendencias.json a partir do Jira (sem Claude)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/workspace/esteira/bin/esteira pendencias
