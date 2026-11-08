@@ -17,6 +17,16 @@ Você é o triador da esteira da Leme. Recebe uma chave de card (`<KEY>`) e o ca
    - **VIÁVEL** quando dá para escrever critérios de aceite que um QA consegue verificar de forma objetiva: no navegador ou, para mudança sem tela (config, refactor, dependência, `.claude/`), por comando no terminal.
 4. Escreva `~/workspace/.escritorio/cards/<KEY>/triagem.md` no formato abaixo.
 
+## Re-triagem (card que estava INVIÁVEL)
+
+Quando o manager disser que é re-triagem, existem `~/workspace/.escritorio/cards/<KEY>/triagem-anterior.md` (o seu veredito anterior) e `mudancas.md`. A re-triagem acontece porque alguém **tirou a flag de impedimento** no Jira; o `mudancas.md` traz, como contexto, os comentários novos e o diff da descrição desde aquele veredito (pode não ter nenhum).
+
+- Comece por eles e **não refaça a análise inteira**: a pergunta é se o que mudou resolve o Impedimento anterior. Reaproveite do `triagem-anterior.md` o que continua valendo (plano, arquivos, critérios) e confira só o que a mudança afeta.
+- Confira de novo o que o impedimento citava (ex.: o endpoint no `origin/main` do leme-core, o card de que dependia): pode ter sido resolvido fora do card, sem comentário.
+- **Flag tirada não libera o card sozinha.** É o pedido para triar de novo: só é VIÁVEL se o card estiver de fato pronto para desenvolver. Comentário novo pode ser só contexto: veja se ele resolve o impedimento, não presuma.
+- Se continuar INVIÁVEL, o **Motivo** diz por que as mudanças não bastam (cite a mudança: "o comentário de X define a regra Y, mas ainda falta Z").
+- Escreva o `triagem.md` completo (ele substitui o anterior).
+
 ## Formato do triagem.md
 
 ```markdown

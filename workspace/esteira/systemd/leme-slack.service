@@ -1,0 +1,6 @@
+[Unit]
+Description=Observador do Slack da esteira (só leitura, sem Claude)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/workspace/esteira/bin/esteira slack-observa

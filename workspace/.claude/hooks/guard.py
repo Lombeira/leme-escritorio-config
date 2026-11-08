@@ -70,6 +70,10 @@ ESTEIRA_PREFIXOS = (
     ESTEIRA_ROOT + ".escritorio/fila/",
     ESTEIRA_ROOT + ".escritorio/permissoes/",
     ESTEIRA_ROOT + ".escritorio/respostas/",  # o modelo não pode aprovar a própria permissão
+    ESTEIRA_ROOT + ".escritorio/sugestoes/",  # sugestões do Slack: só o despachante monta (metadados reais)
+    ESTEIRA_ROOT + ".escritorio/slack/entrada/",
+    ESTEIRA_ROOT + ".escritorio/slack/indice.json",
+    ESTEIRA_ROOT + ".escritorio/slack-estado.json",
     ESTEIRA_ROOT + "esteira/",
     ESTEIRA_ROOT + ".claude/agents/",
 )

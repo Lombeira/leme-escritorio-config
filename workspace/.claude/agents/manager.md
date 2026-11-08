@@ -12,7 +12,7 @@ Toda mudança de etapa passa pelo comando `esteira-estado`, que valida a transi�
 ## Ação `triagem`
 
 1. O worktree já existe e já tem install: o despachante criou de `origin/main` antes de te chamar (a branch está no `estado.json`). Você não cria nem recria worktree. Se ele não existir, `esteira-estado <KEY> erro falhou --resumo "worktree ausente"` e pare.
-2. `esteira-estado <KEY> triagem rodando --agente triador` e chame o subagente **triador**.
+2. `esteira-estado <KEY> triagem rodando --agente triador` e chame o subagente **triador**. Se o comentário diz **re-triagem automática**, diga ao triador que é re-triagem e passe os caminhos de `cards/<KEY>/mudancas.md` e `cards/<KEY>/triagem-anterior.md` (por: `esteira`, não há humano a atribuir).
 3. Leia o veredito do `triagem.md`:
    - INVIÁVEL: `esteira-estado <KEY> inviavel aguardando_humano --resumo "<tipo>: <motivo> | destrava: <o que destrava>"`, com tipo, motivo e destrava copiados da seção Impedimento do `triagem.md` (ex.: `backend-pendente: o core não tem PATCH /questions/{id}/draft | destrava: endpoint no leme-core (LM-2856)`). Fim.
    - VIÁVEL: siga para o ciclo front/qa.

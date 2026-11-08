@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -616,6 +617,8 @@ def cmd_preparar_e_rodar(argv):
             transiciona(key, "erro", "falhou", resumo=f"preparo do worktree do PR: {msg}")
             return 1
     elif acao in ("triagem", "retomar"):  # retomar reaproveita o worktree; só recria se sumiu
+        if acao == "triagem" and worktree(key).exists():
+            print(f"worktree: {atualiza_worktree_triagem(key)}", flush=True)
         ok, msg = prepara_worktree(key)
         print(f"preparo: {msg}", flush=True)
         if not ok:
@@ -874,6 +877,7 @@ class Despachante:
     def __init__(self):
         self.rodando = {}  # key -> (Popen, inicio, arquivo_log)
         self.redatores = {}  # id do novo card -> (Popen, inicio, arquivo_log, pasta); fora das vagas dos cards
+        self.ouvidor = None  # (Popen, inicio, arquivo_log, lote): um lote do ouvidor por vez, fora das vagas
 
     def iniciar(self):
         """Ao subir, adota os managers que continuam vivos (KillMode=process: reiniciar o
@@ -924,6 +928,8 @@ class Despachante:
                 self.remover_anexo_da_fila(arq, dados)
             elif dados.get("acao") in ("novo_card", "confirmar_card"):
                 self.novo_card_da_fila(arq, dados)
+            elif dados.get("acao") in ("sugestao_aprovar", "sugestao_duplicada", "sugestao_ignorar", "sugestao_descartar"):
+                self.sugestao_da_fila(arq, dados)
             else:
                 pedidos.append((dados.get("em", 0), arq, dados))
         if atualizar:
@@ -1015,6 +1021,8 @@ class Despachante:
                 if ocupado or not reabrivel:
                     self.rejeita(arq, f"{key} já está na esteira ({est and est['etapa']})")
                     continue
+                for velho in ("mudancas.md", "triagem-anterior.md"):  # triagem pedida no escritório começa do zero
+                    (CARDS / key / velho).unlink(missing_ok=True)
                 info = self.info_pendencia(key)
                 transiciona(key, "fila", "rodando", resumo="na fila", summary=info.get("summary", ""),
                             assignee=info.get("assignee", ""), por_despachante=True)
@@ -1038,6 +1046,104 @@ class Despachante:
                 escreve_json(caminho_interno(key), interno)
             os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
             log(f"fila: {key} {acao} por {por} aceito")
+
+    def sugestao_da_fila(self, arq, p):
+        acao, por = p.get("acao"), p.get("por")
+        if por not in ("glauco", "feda"):
+            return self.rejeita(arq, f"{acao} exige por (glauco|feda)")
+        pasta = pasta_sugestao(p.get("sugestao"))
+        if not pasta:
+            return self.rejeita(arq, f"sugestão {p.get('sugestao')!r} não existe ou id inválido")
+        sug = le_json(pasta / "sugestao.json", {}) or {}
+        status = (le_json(pasta / "estado.json", {}) or {}).get("status")
+        if status in ("criando", "criado", "duplicada", "ignorada", "descartada"):
+            return self.rejeita(arq, f"sugestão já resolvida ({status})")
+        cfg = le_env(CONFIG / "atlassian.env")
+        if acao == "sugestao_aprovar":
+            final = {k: p.get(k) for k in ("titulo", "descricao", "tipo", "responsavel")}
+            if not (final["titulo"] and final["descricao"]):
+                return self.rejeita(arq, "sugestao_aprovar exige titulo e descricao")
+            final["descricao"] = (final["descricao"].rstrip() + f"\n\n**Origem:** [Slack #{sug.get('canal')}]"
+                                  f"({sug.get('permalink')}), mensagem de {sug.get('autor')}")
+            imagens = [pasta / n for n in sug.get("prints") or [] if "/" not in n and (pasta / n).is_file()]
+            escreve_json(pasta / "estado.json", {"status": "criando"})
+            ok, campos = cria_issue(final, imagens, lambda c: escreve_json(pasta / "estado.json", {"status": "criando", **c}))
+            escreve_json(pasta / "estado.json", {"status": "criado" if ok else "erro", **campos})
+            log(f"sugestão {pasta.name}: {'criado ' + campos['key'] if ok else 'erro: ' + campos['motivo']} (por {por})")
+            if ok:
+                log(f"sugestão {pasta.name}: pendências atualizadas ({atualiza_pendencias()[1]})")
+        elif acao == "sugestao_duplicada":
+            key = p.get("key")
+            if not (isinstance(key, str) and re.fullmatch(r"LM-\d+", key)):
+                return self.rejeita(arq, "sugestao_duplicada exige key LM-<n>")
+            url = f"https://{cfg['ATLASSIAN_SITE']}/browse/{key}"
+            escreve_json(pasta / "estado.json", {"status": "duplicada", "key": key, "url": url})
+            if (le_json(CONFIG_ESTEIRA, {}) or {}).get("comentar_duplicata"):
+                ok_c, msg_c = comenta_duplicata(key, sug, por)
+                log(f"sugestão {pasta.name}: comentário em {key}: {msg_c}")
+            log(f"sugestão {pasta.name}: duplicada de {key} (por {por})")
+        elif acao == "sugestao_descartar":
+            # Só tira da frente: não ensina o ouvidor (nada vai para a memória).
+            comentario = (p.get("comentario") or "").strip() or None
+            escreve_json(pasta / "estado.json", {"status": "descartada", "comentario": comentario})
+            log(f"sugestão {pasta.name}: descartada por {por} (sem ensinar o ouvidor)")
+        else:
+            motivo = (p.get("comentario") or "").strip()
+            if not motivo:
+                return self.rejeita(arq, "sugestao_ignorar exige comentario com o motivo")
+            escreve_json(pasta / "estado.json", {"status": "ignorada", "motivo": motivo})
+            registra_motivo_ignorado(sug, motivo, por)
+            log(f"sugestão {pasta.name}: ignorada por {por}; motivo guardado para o ouvidor")
+        os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+
+    def dispara_ouvidor(self):
+        pendentes = entradas_pendentes()
+        if not pendentes or self.ouvidor:
+            return
+        lote = pendentes[:15]
+        indice = le_json(SLACK_INDICE, {}) or {}
+        for eid in lote:
+            indice[eid]["tentativas"] = indice[eid].get("tentativas", 0) + 1
+            if indice[eid]["tentativas"] > 3:
+                indice[eid] = {"estado": "descartada", "motivo": "ouvidor sem decisão em 3 rodadas"}
+                import shutil
+                shutil.rmtree(SLACK_ENTRADA / eid, ignore_errors=True)
+        escreve_json(SLACK_INDICE, indice)
+        lote = [e for e in lote if indice[e].get("estado") == "pendente"]
+        if not lote:
+            return
+        prompt = ("Lote do ouvidor. Entradas (cada uma é uma pasta com mensagem.json e prints): "
+                  + ", ".join(str(SLACK_ENTRADA / e) for e in lote)
+                  + f". Para cada uma escreva {SLACK_DECISOES}/<id>.json. Siga as instruções do agente ouvidor.")
+        arq_log = LOGS / f"ouvidor-{agora()}.log"
+        cmd = ["claude", "-p", "--agent", "ouvidor", "--permission-mode", "acceptEdits",
+               "--allowedTools", "Read,Glob,Grep,Write,mcp__atlassian__searchJiraIssuesUsingJql,mcp__atlassian__getJiraIssue",
+               "--disallowedTools", ",".join(PROIBIDAS + ["Bash", "Edit", "Agent"]),
+               "--output-format", "stream-json", "--verbose", prompt]
+        f = open(arq_log, "w", encoding="utf-8")
+        env = env_systemd()
+        env["ESTEIRA_HEADLESS"] = "1"
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
+        self.ouvidor = (proc, agora(), f, lote)
+        log(f"ouvidor disparado com {len(lote)} entrada(s), pid {proc.pid}")
+
+    def colhe_ouvidor(self):
+        if not self.ouvidor:
+            return
+        proc, inicio, f, lote = self.ouvidor
+        rc = proc.poll()
+        if rc is None and agora() - inicio > TIMEOUT_REDATOR_S:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            rc = "timeout"
+        if rc is None:
+            return
+        f.close()
+        self.ouvidor = None
+        feitas = materializa_decisoes()
+        self.registra_custo_redator(f"ouvidor-{inicio}", Path(f.name), agente="ouvidor", setor="ouvidor",
+                                    execucao="lote_slack")
+        log(f"ouvidor terminou (rc={rc}): {len(feitas)} sugestão(ões) nova(s) de {len(lote)} entrada(s)")
 
     def novo_card_da_fila(self, arq, p):
         acao, nid, por = p.get("acao"), p.get("novo"), p.get("por")
@@ -1104,15 +1210,15 @@ class Despachante:
             self.registra_custo_redator(nid, Path(f.name))
             log(f"novo {nid}: redator terminou -> {(le_json(pasta / 'estado.json', {}) or {}).get('status')}")
 
-    def registra_custo_redator(self, nid, arq_log):
+    def registra_custo_redator(self, nid, arq_log, agente="redator", setor="redacao", execucao="novo_card"):
         try:
             for linha in arq_log.read_text(encoding="utf-8", errors="replace").splitlines():
                 if '"type":"result"' in linha.replace(" ", ""):
                     r = json.loads(linha)
                     for modelo, dados in (r.get("modelUsage") or {}).items():
                         with open(ESC / "custos.jsonl", "a", encoding="utf-8") as c:
-                            c.write(json.dumps({"em": agora(), "card": nid, "execucao": "novo_card", "agente": "redator",
-                                                "setor": "redacao", "modelo": modelo,
+                            c.write(json.dumps({"em": agora(), "card": nid, "execucao": execucao, "agente": agente,
+                                                "setor": setor, "modelo": modelo,
                                                 "custo_usd": round(dados.get("costUSD") or 0, 4)}) + "\n")
         except (OSError, json.JSONDecodeError):
             pass
@@ -1406,6 +1512,93 @@ class Despachante:
                 if flag_ok:
                     interno["flag_por_esteira"] = True
                 escreve_json(caminho_interno(key), interno)
+            self.fotografa_inviavel(key)
+
+    def fotografa_inviavel(self, key):
+        try:
+            foto = foto_de(le_card_jira(key))
+        except Exception as e:
+            log(f"{key}: foto do card no Jira falhou ({e!r}); a re-triagem compara a partir da próxima checagem")
+            return
+        with trava(key):
+            interno = le_json(caminho_interno(key), {})
+            interno["foto_inviavel"] = foto
+            escreve_json(caminho_interno(key), interno)
+
+    def checa_inviaveis(self):
+        """A cada retriagem_horas (1 h; só API do Jira, sem Claude): inviável com a flag tirada volta para a triagem."""
+        horas = (le_json(CONFIG_ESTEIRA, {}) or {}).get("retriagem_horas", 1)
+        if not horas or agora() - getattr(self, "ultima_retriagem", 0) < horas * 3600:
+            return
+        self.ultima_retriagem = agora()
+        for est_path in CARDS.glob("*/estado.json"):
+            est = le_json(est_path) or {}
+            key = est.get("key")
+            if not key or est.get("tipo") == "revisao_pr" or est.get("etapa") != "inviavel" \
+                    or est.get("status") != "aguardando_humano" or key in self.rodando:
+                continue
+            interno = le_json(caminho_interno(key), {})
+            if interno.get("pendente"):
+                continue
+            try:
+                card = le_card_jira(key)
+            except Exception as e:
+                log(f"{key}: re-triagem: leitura do Jira falhou ({e!r})")
+                continue
+            if card["status"] not in JIRA_GERIDOS:
+                continue  # o time levou o card para outro status; não é mais da esteira
+            foto = interno.get("foto_inviavel")
+            if foto and "assignee" not in foto:  # foto de antes da proteção: base do responsável é agora
+                foto["assignee"] = card.get("assignee")
+                with trava(key):
+                    interno = le_json(caminho_interno(key), {})
+                    interno["foto_inviavel"] = foto
+                    escreve_json(caminho_interno(key), interno)
+            novo_resp = card.get("assignee")
+            if foto and novo_resp and novo_resp != foto.get("assignee") and novo_resp not in JIRA_ASSIGNEES:
+                # Alguém de fora da esteira pegou o card para fazer: não re-tria (avisa uma vez no log).
+                if interno.get("retriagem_pulada") != novo_resp:
+                    log(f"{key}: re-triagem pulada: responsável no Jira mudou para {card.get('assignee_nome')}, "
+                        f"que não é da esteira")
+                    with trava(key):
+                        interno = le_json(caminho_interno(key), {})
+                        interno["retriagem_pulada"] = novo_resp
+                        escreve_json(caminho_interno(key), interno)
+                continue
+            if not foto:  # inviável de antes deste recurso: compara a partir do veredito
+                marca = next((h["em"] for h in reversed(est.get("historico", [])) if h.get("etapa") == "inviavel"), 0)
+                foto = {"descricao": None, "flag": bool(interno.get("flag_por_esteira")), "assignee": card.get("assignee"),
+                        "comentarios": {c["id"]: c.get("updated") or c.get("created") for c in card["comentarios"]
+                                        if _epoch_jira(c.get("updated") or c.get("created")) <= marca}}
+            # Só a flag tirada dispara (comentário às vezes é só contexto). A foto não é atualizada enquanto
+            # isso: comentários e descrição desde o veredito se acumulam e vão juntos no mudancas.md.
+            if not (foto.get("flag") and not card["flag"]):
+                if not interno.get("foto_inviavel"):
+                    with trava(key):
+                        interno = le_json(caminho_interno(key), {})
+                        interno["foto_inviavel"] = foto  # inviável antigo: base é o veredito
+                        escreve_json(caminho_interno(key), interno)
+                continue
+            motivos, delta = mudancas_desde(foto, card)
+            pasta = CARDS / key
+            (pasta / "mudancas.md").write_text(
+                f"# {key}: o que mudou desde o veredito INVIÁVEL\n\n" + delta, encoding="utf-8")
+            if (pasta / "triagem.md").exists():
+                (pasta / "triagem-anterior.md").write_text((pasta / "triagem.md").read_text(encoding="utf-8"),
+                                                           encoding="utf-8")
+            resumo = "re-triagem: " + "; ".join(motivos)
+            try:
+                transiciona(key, "fila", "rodando", resumo=resumo, por_despachante=True)
+            except TransicaoInvalida as e:
+                log(f"{key}: re-triagem não aplicada: {e}")
+                continue
+            with trava(key):
+                interno = le_json(caminho_interno(key), {})
+                interno["pendente"] = {"acao": "triagem", "por": "esteira", "em": agora(), "comentario":
+                                       f"re-triagem automática ({'; '.join(motivos)}). Leia cards/{key}/mudancas.md "
+                                       f"e cards/{key}/triagem-anterior.md e passe ao triador que é re-triagem."}
+                escreve_json(caminho_interno(key), interno)
+            log(f"{key}: {resumo}")
 
     def varre_previews(self):
         for est_path in CARDS.glob("*/estado.json"):
@@ -1428,9 +1621,12 @@ class Despachante:
                 self.processa_fila()
                 self.colhe()
                 self.colhe_redatores()
+                self.colhe_ouvidor()
+                self.dispara_ouvidor()
                 self.agenda()
                 self.varre_previews()
                 self.sincroniza_jira()
+                self.checa_inviaveis()
             except Exception as e:  # o loop não pode morrer por um card ruim
                 log(f"erro no ciclo: {e!r}")
             time.sleep(10)
@@ -1734,10 +1930,13 @@ def _inline_adf(texto):
     """`código` e **negrito** viram marcas; o resto é texto."""
     import re
     nos = []
-    for pedaco in re.split(r"(`[^`]+`|\*\*[^*]+\*\*)", texto):
+    for pedaco in re.split(r"(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?://[^)\s]+\))", texto):
         if not pedaco:
             continue
-        if pedaco.startswith("`") and pedaco.endswith("`") and len(pedaco) > 1:
+        link = re.fullmatch(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", pedaco)
+        if link:
+            nos.append({"type": "text", "text": link.group(1), "marks": [{"type": "link", "attrs": {"href": link.group(2)}}]})
+        elif pedaco.startswith("`") and pedaco.endswith("`") and len(pedaco) > 1:
             nos.append({"type": "text", "text": pedaco[1:-1], "marks": [{"type": "code"}]})
         elif pedaco.startswith("**") and pedaco.endswith("**") and len(pedaco) > 4:
             nos.append({"type": "text", "text": pedaco[2:-2], "marks": [{"type": "strong"}]})
@@ -1838,6 +2037,13 @@ def cria_card_no_jira(pasta):
     pedido = le_json(pasta / "pedido.json", {}) or {}
     if not isinstance(final, dict) or not (final.get("titulo") and final.get("descricao")):
         return False, {"motivo": "final.json ausente ou sem titulo/descricao"}
+    imagens = [pasta / n for n in pedido.get("imagens") or []
+               if isinstance(n, str) and "/" not in n and ".." not in n and (pasta / n).is_file()]
+    return cria_issue(final, imagens, lambda campos: estado_novo_card(pasta, status="criando", **campos))
+
+
+def cria_issue(final, imagens, grava_key):
+    """Cria a issue (texto exato do humano), grava a key antes de anexar e anexa as imagens."""
     tipo, resp = final.get("tipo"), final.get("responsavel")
     if tipo not in TIPO_ISSUE or resp not in CONTA_JIRA:
         return False, {"motivo": f"tipo ({tipo}) ou responsavel ({resp}) inválido"}
@@ -1856,9 +2062,7 @@ def cria_card_no_jira(pasta):
     key = criado["key"]
     cfg = le_env(CONFIG / "atlassian.env")
     resultado = {"key": key, "url": f"https://{cfg['ATLASSIAN_SITE']}/browse/{key}"}
-    estado_novo_card(pasta, status="criando", **resultado)  # a key fica gravada antes de qualquer outro passo
-    imagens = [pasta / n for n in pedido.get("imagens") or []
-               if isinstance(n, str) and "/" not in n and ".." not in n and (pasta / n).is_file()]
+    grava_key(resultado)  # a key fica gravada antes de qualquer outro passo
     if imagens:
         try:
             anexa_arquivos(key, imagens)
@@ -1866,6 +2070,305 @@ def cria_card_no_jira(pasta):
         except Exception as e:
             resultado["motivo"] = f"card criado, mas os prints não foram anexados: {e!r}"
     return True, {**resultado, "sprint": bool(sprint)}
+
+
+# ---------- Slack: observador (sem Claude) e sugestões ----------
+# Só leitura no Slack: o código usa apenas métodos de consulta e download de arquivo.
+
+SLACK_DIR = ESC / "slack"
+SLACK_ENTRADA = SLACK_DIR / "entrada"
+SLACK_DECISOES = SLACK_DIR / "decisoes"
+SLACK_INDICE = SLACK_DIR / "indice.json"
+SLACK_ESTADO = ESC / "slack-estado.json"
+SUGESTOES = ESC / "sugestoes"
+MEMORIA_OUVIDOR = ROOT / "memory" / "ouvidor-o-que-nao-sugerir.md"
+SLACK_JANELA_INICIAL_S = 24 * 3600
+SLACK_THREADS_DIAS = 7
+PALAVRAS_BUG = re.compile(
+    r"\b(bug|erro|error|quebr\w*|n[aã]o (funciona|carrega|aparece|abre|salva|consigo|deixa)|trav\w+|sumiu|sumindo|"
+    r"falh\w+|problema|crash|500|tela branca|lent[oa]|bloquead\w*|n[aã]o est[aá] (funcionando|carregando|aparecendo))\b",
+    re.IGNORECASE)
+
+
+def slack_get(metodo, **params):
+    """GET num método de leitura da API do Slack, com o token do slack.env (nunca impresso)."""
+    tok = le_env(CONFIG / "slack.env")["SLACK_BOT_TOKEN"]
+    for _ in range(5):
+        req = urllib.request.Request(f"https://slack.com/api/{metodo}?{urllib.parse.urlencode(params)}",
+                                     headers={"Authorization": f"Bearer {tok}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                dados = json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(int(e.headers.get("Retry-After", "5")))
+                continue
+            raise
+        if not dados.get("ok"):
+            raise RuntimeError(f"Slack {metodo}: {dados.get('error')}")
+        return dados
+    raise RuntimeError(f"Slack {metodo}: limite de taxa")
+
+
+def slack_paginado(metodo, chave, **params):
+    itens, cursor = [], None
+    while True:
+        dados = slack_get(metodo, **params, **({"cursor": cursor} if cursor else {}))
+        itens += dados.get(chave, [])
+        cursor = (dados.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            return itens, dados
+
+
+def slack_baixa(url, destino, limite=15_000_000):
+    tok = le_env(CONFIG / "slack.env")["SLACK_BOT_TOKEN"]
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        dados = r.read(limite + 1)
+    if len(dados) > limite:
+        raise RuntimeError("arquivo grande demais")
+    destino.write_bytes(dados)
+
+
+def id_entrada(canal, ts):
+    return f"{canal}-{ts.replace('.', '_')}"
+
+
+# Bots cujas mensagens são relato (não ruído): entram sempre, sem filtro de palavra. config.json slack_bots_aceitos sobrescreve.
+SLACK_BOTS_ACEITOS = {"B0CE0QPU4JZ": "Capitão Leme"}
+
+
+def bots_aceitos():
+    return (le_json(CONFIG_ESTEIRA, {}) or {}).get("slack_bots_aceitos") or SLACK_BOTS_ACEITOS
+
+
+def _relevante(msg, bot_user):
+    if msg.get("bot_id") in bots_aceitos() and msg.get("subtype") in (None, "bot_message"):
+        return bool((msg.get("text") or "").strip())
+    if msg.get("bot_id") or msg.get("subtype") in ("bot_message", "channel_join", "channel_leave", "channel_topic",
+                                                   "channel_purpose", "channel_name", "tombstone"):
+        return False
+    if msg.get("user") in (None, bot_user):
+        return False
+    return bool(msg.get("files")) or bool(PALAVRAS_BUG.search(msg.get("text") or ""))
+
+
+def observa_slack(maximo=None, janela_inicial_s=SLACK_JANELA_INICIAL_S):
+    """Uma rodada: canais em que o app é membro, mensagens novas e respostas de thread com arquivo ou
+    palavra de bug viram entradas em slack/entrada/<canal>-<ts>/. Retorna um resumo."""
+    import unicodedata
+    estado = le_json(SLACK_ESTADO, {}) or {}
+    canais_est = estado.setdefault("canais", {})
+    indice = le_json(SLACK_INDICE, {}) or {}
+    auth = slack_get("auth.test")
+    bot_user, dominio = auth.get("user_id"), (auth.get("url") or "https://leme.slack.com/").rstrip("/")
+    membros, _ = slack_paginado("users.conversations", "channels", types="public_channel,private_channel",
+                                exclude_archived="true", limit=200)
+    atuais = {c["id"]: c["name"] for c in membros}
+    for cid in set(canais_est) - set(atuais):
+        log(f"slack: canal saiu: #{canais_est[cid].get('nome')} ({cid})")
+        canais_est.pop(cid)
+    agora_ts = time.time()
+    for cid, nome in atuais.items():
+        if cid not in canais_est:
+            canais_est[cid] = {"nome": nome, "ultimo_ts": f"{agora_ts - janela_inicial_s:.6f}", "threads": {}}
+            log(f"slack: canal entrou: #{nome} ({cid}); começa em agora menos {janela_inicial_s // 3600} h")
+        canais_est[cid]["nome"] = nome
+    nomes = estado.setdefault("nomes", {})
+
+    def autor(uid):
+        if uid not in nomes:
+            try:
+                u = slack_get("users.info", user=uid)["user"]
+                nomes[uid] = (u.get("profile") or {}).get("real_name") or u.get("real_name") or u.get("name") or uid
+            except Exception:
+                nomes[uid] = uid
+        return nomes[uid]
+
+    def autor_msg(msg):
+        if msg.get("user"):
+            return autor(msg["user"])
+        nome = bots_aceitos().get(msg.get("bot_id")) or "bot"
+        quem = re.search(r"mailto:([^|>]+)", msg.get("text") or "")
+        return f"{nome} (avaliação de {quem.group(1)})" if quem else nome
+
+    novas, examinadas = [], 0
+    limite_thread = agora_ts - SLACK_THREADS_DIAS * 86400
+    for cid, c in canais_est.items():
+        msgs, _ = slack_paginado("conversations.history", "messages", channel=cid, oldest=c["ultimo_ts"], limit=200)
+        candidatas = []
+        for m in msgs:
+            examinadas += 1
+            c["ultimo_ts"] = max(c["ultimo_ts"], m["ts"], key=float)
+            if m.get("reply_count") and float(m["ts"]) > limite_thread:
+                c["threads"].setdefault(m["ts"], m["ts"])
+            candidatas.append((m, None))
+        for pai, visto in list(c["threads"].items()):
+            if float(pai) < limite_thread:
+                c["threads"].pop(pai)
+                continue
+            respostas, _ = slack_paginado("conversations.replies", "messages", channel=cid, ts=pai, oldest=visto, limit=200)
+            for r in respostas:
+                if r["ts"] == pai or float(r["ts"]) <= float(visto):
+                    continue
+                examinadas += 1
+                c["threads"][pai] = max(c["threads"][pai], r["ts"], key=float)
+                candidatas.append((r, pai))
+        for m, pai in sorted(candidatas, key=lambda x: float(x[0]["ts"])):
+            eid = id_entrada(cid, m["ts"])
+            if eid in indice or not _relevante(m, bot_user):
+                continue
+            if maximo is not None and len(novas) >= maximo:
+                break
+            pasta = SLACK_ENTRADA / eid
+            pasta.mkdir(parents=True, exist_ok=True)
+            prints = []
+            for f in m.get("files") or []:
+                if not str(f.get("mimetype", "")).startswith("image/") or not f.get("url_private_download"):
+                    continue
+                nome_arq = re.sub(r"[^\w.\-]", "_", f.get("name") or f["id"])[:80]
+                try:
+                    slack_baixa(f["url_private_download"], pasta / nome_arq)
+                    prints.append(nome_arq)
+                except Exception as e:
+                    log(f"slack: não baixei {nome_arq} de {eid}: {e!r}")
+            link = f"{dominio}/archives/{cid}/p{m['ts'].replace('.', '')}" + (f"?thread_ts={pai}&cid={cid}" if pai else "")
+            # Contexto da thread (mensagem de origem + respostas): a explicação ou a solução costuma estar
+            # nas respostas. Só para o ouvidor decidir; não vai para a sugestão.
+            thread = []
+            raiz = pai or (m["ts"] if m.get("reply_count") else None)
+            if raiz:
+                try:
+                    msgs_thread, _ = slack_paginado("conversations.replies", "messages", channel=cid, ts=raiz, limit=200)
+                    thread = [{"autor": autor_msg(r),
+                               "texto": (r.get("text") or "")[:1500], "ts": r["ts"],
+                               "e_esta_mensagem": r["ts"] == m["ts"], "tem_arquivo": bool(r.get("files"))}
+                              for r in msgs_thread[:60]]
+                except Exception as e:
+                    log(f"slack: não li a thread de {eid}: {e!r}")
+            escreve_json(pasta / "mensagem.json", {
+                "id": eid, "canal_id": cid, "canal": c["nome"], "ts_slack": m["ts"], "thread_ts": pai,
+                "autor": autor_msg(m), "criado": int(float(m["ts"])), "permalink": link,
+                "texto_original": m.get("text") or "", "prints": prints, "thread": thread})
+            indice[eid] = {"estado": "pendente", "tentativas": 0}
+            novas.append(eid)
+    escreve_json(SLACK_ESTADO, estado)
+    escreve_json(SLACK_INDICE, indice)
+    resumo = f"{len(atuais)} canais, {examinadas} mensagens examinadas, {len(novas)} entradas novas"
+    log(f"slack: {resumo}")
+    return resumo, novas
+
+
+def cmd_slack_observa(argv):
+    maximo = int(argv[argv.index("--max") + 1]) if "--max" in argv else None
+    for d in (SLACK_ENTRADA, SLACK_DECISOES, SUGESTOES):
+        d.mkdir(parents=True, exist_ok=True)
+    janela = int(argv[argv.index("--desde-dias") + 1]) * 86400 if "--desde-dias" in argv else SLACK_JANELA_INICIAL_S
+    resumo, novas = observa_slack(maximo, janela)
+    print(resumo)
+    for n in novas:
+        print(" ", n)
+    return 0
+
+
+def novo_id_sugestao():
+    import secrets
+    return f"s{int(time.time() * 1000)}{secrets.token_hex(3)}"
+
+
+def materializa_decisoes():
+    """Decisões do ouvidor viram sugestões (montadas aqui, com os metadados da mensagem real).
+    Não acionável: a entrada é apagada (não fica texto de aluno à toa). Uma sugestão por mensagem."""
+    import shutil
+    indice = le_json(SLACK_INDICE, {}) or {}
+    feitas = []
+    for eid, info in list(indice.items()):
+        if info.get("estado") != "pendente":
+            continue
+        decisao = le_json(SLACK_DECISOES / f"{eid}.json")
+        pasta = SLACK_ENTRADA / eid
+        msg = le_json(pasta / "mensagem.json")
+        if not isinstance(decisao, dict) or not msg:
+            continue
+        if not decisao.get("acionavel"):
+            indice[eid] = {"estado": "descartada"}
+        else:
+            s = decisao.get("sugestao") or {}
+            if s.get("tipo") not in ("bug", "tarefa") or s.get("responsavel") not in ("glauco", "feda") \
+                    or not s.get("titulo") or not s.get("descricao"):
+                indice[eid] = {"estado": "descartada", "motivo": "decisão incompleta do ouvidor"}
+            else:
+                sid = novo_id_sugestao()
+                destino = SUGESTOES / sid
+                dup_de = decisao.get("duplicata_de") or None
+                if dup_de and not re.fullmatch(r"LM-\d+", str(dup_de)):
+                    dup_de = None  # só chave de card do LM; resto do texto do modelo é descartado
+                dup_titulo = (decisao.get("duplicata_titulo") or None) if dup_de else None
+                destino.mkdir(parents=True)
+                for p in msg.get("prints") or []:
+                    if (pasta / p).is_file() and p.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                        shutil.copy2(pasta / p, destino / p)
+                escreve_json(destino / "sugestao.json", {
+                    "id": sid, "canal": msg["canal"], "autor": msg["autor"], "criado": msg["criado"],
+                    "permalink": msg["permalink"], "texto_original": msg["texto_original"], "ts_slack": msg["ts_slack"],
+                    "sugestao": {k: s.get(k) for k in ("tipo", "titulo", "descricao", "responsavel", "motivo")},
+                    "duplicata_de": dup_de,  # no topo: o escritório pré-preenche o "Já existe…" com ela
+                    "duplicata_titulo": dup_titulo,
+                    "prints": [p for p in msg.get("prints") or [] if (destino / p).exists()]})
+                nota = decisao.get("nota_thread")
+                nota = " ".join(str(nota).split())[:280] if isinstance(nota, str) and nota.strip() else None
+                escreve_json(destino / "estado.json", {"status": "sugerida", "nota_thread": nota})
+                indice[eid] = {"estado": "sugerida", "sugestao": sid}
+                feitas.append(sid)
+        shutil.rmtree(pasta, ignore_errors=True)
+        (SLACK_DECISOES / f"{eid}.json").unlink(missing_ok=True)
+    escreve_json(SLACK_INDICE, indice)
+    return feitas
+
+
+def entradas_pendentes():
+    indice = le_json(SLACK_INDICE, {}) or {}
+    return sorted(e for e, i in indice.items() if i.get("estado") == "pendente" and (SLACK_ENTRADA / e).is_dir())
+
+
+def pasta_sugestao(sid):
+    if not isinstance(sid, str) or not re.fullmatch(r"s[A-Za-z0-9_-]{5,59}", sid):
+        return None
+    p = SUGESTOES / sid
+    return p if (p / "sugestao.json").is_file() else None
+
+
+def comenta_duplicata(key, sug, por):
+    """Opcional (config comentar_duplicata): avisa no card existente que houve mais um relato no Slack."""
+    texto = (f"🤖 Mais um relato no Slack: [#{sug.get('canal')}]({sug.get('permalink')}), de {sug.get('autor')}. "
+             f"Marcado como duplicata deste card por {por} no escritório.")
+    try:
+        jira_req(f"issue/{key}/comment", "POST", {"body": md_para_adf(texto)})
+        return True, "comentado"
+    except Exception as e:
+        return False, f"falhou: {e!r}"
+
+
+def registra_motivo_ignorado(sug, motivo, por):
+    """Só o motivo (escrito pelo humano), o tipo e o canal: nunca o texto da mensagem do Slack."""
+    MEMORIA_OUVIDOR.parent.mkdir(parents=True, exist_ok=True)
+    if not MEMORIA_OUVIDOR.exists():
+        MEMORIA_OUVIDOR.write_text(
+            "---\nname: ouvidor-o-que-nao-sugerir\ndescription: \"Motivos pelos quais Glauco/Feda ignoraram sugestões de "
+            "card do ouvidor do Slack; o ouvidor lê antes de decidir\"\nmetadata:\n  type: feedback\n---\n\n"
+            "Cada linha: data, canal, tipo sugerido e o motivo de quem ignorou. Sem texto das mensagens "
+            "(podem ter nome de aluno).\n\n**Why:** o ouvidor aprende o que o time não quer como card.\n\n"
+            "**How to apply:** antes de sugerir, conferir se o caso bate com algum motivo abaixo; se bater, descartar.\n\n",
+            encoding="utf-8")
+        idx = ROOT / "memory" / "MEMORY.md"
+        if idx.exists() and "ouvidor-o-que-nao-sugerir" not in idx.read_text():
+            with open(idx, "a", encoding="utf-8") as f:
+                f.write("- [Ouvidor: o que não sugerir](ouvidor-o-que-nao-sugerir.md) — motivos das sugestões do Slack "
+                        "que o time ignorou\n")
+    linha = (f"- {time.strftime('%d/%m/%Y')} · #{sug.get('canal')} · {(sug.get('sugestao') or {}).get('tipo')} · "
+             f"ignorado por {por}: {' '.join(str(motivo).split())[:300]}\n")
+    with open(MEMORIA_OUVIDOR, "a", encoding="utf-8") as f:
+        f.write(linha)
 
 
 # ---------- comentário no Jira ----------
@@ -1984,6 +2487,103 @@ def marca_impedimento(key, ligar):
         return False, f"falhou: {e!r}"
 
 
+# ---------- re-triagem dos inviáveis ----------
+# Card inviável volta à triagem quando alguém tira a flag de impedimento no Jira. Comentários e descrição
+# alterados desde o veredito vão como contexto (os da própria esteira, que começam com 🤖, ficam de fora).
+
+def adf_texto(no):
+    if isinstance(no, list):
+        return "".join(adf_texto(n) for n in no)
+    if not isinstance(no, dict):
+        return ""
+    t, attrs = no.get("type"), no.get("attrs") or {}
+    if t == "text":
+        return no.get("text", "")
+    if t == "hardBreak":
+        return "\n"
+    if t == "mention":
+        return attrs.get("text", "@?")
+    if t in ("inlineCard", "blockCard"):
+        return attrs.get("url", "")
+    dentro = adf_texto(no.get("content") or [])
+    if t == "listItem":
+        return "- " + dentro.strip() + "\n"
+    if t in ("paragraph", "heading", "codeBlock", "blockquote", "rule", "table", "tableRow"):
+        return dentro + "\n\n"
+    return dentro
+
+
+def _epoch_jira(iso):
+    import datetime
+    try:
+        return int(datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S.%f%z").timestamp())
+    except (TypeError, ValueError):
+        return 0
+
+
+def le_card_jira(key):
+    campos = jira_req(f"issue/{key}?fields=description,status,assignee,{JIRA_CAMPO_FLAG}")["fields"]
+    coms = jira_req(f"issue/{key}/comment?maxResults=100&orderBy=created").get("comments", [])
+    for c in coms:
+        c["_texto"] = adf_texto(c.get("body")).strip()
+        c["_robo"] = c["_texto"].startswith("🤖")
+    return {"descricao": adf_texto(campos.get("description")).strip(), "flag": bool(campos.get(JIRA_CAMPO_FLAG)),
+            "status": (campos.get("status") or {}).get("id"), "comentarios": coms,
+            "assignee": (campos.get("assignee") or {}).get("accountId"),
+            "assignee_nome": (campos.get("assignee") or {}).get("displayName")}
+
+
+def foto_de(card):
+    return {"descricao": card["descricao"], "flag": card["flag"], "assignee": card.get("assignee"),
+            "comentarios": {c["id"]: c.get("updated") or c.get("created") for c in card["comentarios"]}, "em": agora()}
+
+
+def mudancas_desde(foto, card):
+    """(motivos curtos, markdown do delta) entre a foto do veredito e o card atual."""
+    import difflib
+    motivos, partes = [], []
+    novos = [c for c in card["comentarios"] if not c["_robo"]
+             and foto["comentarios"].get(c["id"]) != (c.get("updated") or c.get("created"))]
+    if novos:
+        quem = sorted({(c.get("author") or {}).get("displayName", "?") for c in novos})
+        motivos.append(f"{len(novos)} comentário(s) novo(s) de {', '.join(quem)}")
+        partes.append("## Comentários novos ou editados desde o veredito anterior\n")
+        for c in novos:
+            editado = " (editado)" if c["id"] in foto["comentarios"] else ""
+            partes.append(f"### {(c.get('author') or {}).get('displayName', '?')} em {c.get('updated') or c.get('created')}"
+                          f"{editado}\n\n{c['_texto'][:4000]}\n")
+    if foto.get("descricao") is not None and foto["descricao"] != card["descricao"]:
+        motivos.append("descrição alterada")
+        diff = list(difflib.unified_diff(foto["descricao"].splitlines(), card["descricao"].splitlines(),
+                                         "descrição no veredito anterior", "descrição agora", lineterm="", n=2))
+        partes.append("## Descrição: o que mudou\n\n```diff\n" + "\n".join(diff[:300]) + "\n```\n")
+    if foto.get("flag") and not card["flag"]:
+        motivos.append("flag de impedimento tirada no Jira")
+        partes.append("## Flag\n\nAlguém tirou a flag de impedimento no Jira. Isso **não** libera o card sozinho: "
+                      "é o pedido para triar de novo e confirmar se está pronto para desenvolver.\n")
+    return motivos, "\n".join(partes)
+
+
+def atualiza_worktree_triagem(key):
+    """Re-triagem: traz o worktree para a origin/main se estiver limpo e sem commit próprio (ff-only)."""
+    wt = worktree(key)
+    git = ["git", "-C", str(wt)]
+    if subprocess.run(git + ["fetch", "-q", "origin"], capture_output=True).returncode != 0:
+        return "git fetch falhou; triagem no worktree como está"
+    if subprocess.run(git + ["status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                      text=True).stdout.strip():
+        return "worktree com mudança; não atualizei"
+    deps = subprocess.run(git + ["diff", "--quiet", "HEAD", "origin/main", "--", "package.json", "pnpm-lock.yaml"],
+                          capture_output=True).returncode != 0
+    if subprocess.run(git + ["merge", "--ff-only", "-q", "origin/main"], capture_output=True).returncode != 0:
+        return "worktree tem commit próprio; não atualizei"
+    if deps:
+        r = subprocess.run(["pnpm", "install", "--frozen-lockfile"], cwd=wt, capture_output=True, timeout=1200,
+                           env={**os.environ, "PATH": path_com_node(wt)})
+        return "atualizado para origin/main" + ("" if r.returncode == 0 else "; pnpm install falhou")
+    return "atualizado para origin/main"
+
+
 def atribui_se_vazio(key, por):
     """Card que entra na esteira sem responsável no Jira fica com quem mandou pelo escritório.
     Se já tem responsável, não troca. Retorna (ok, mensagem); erro não trava a triagem."""
@@ -2093,6 +2693,8 @@ def main():
     if sub == "despachante":
         Despachante().loop()
         return 0
+    if sub == "slack-observa":
+        return cmd_slack_observa(argv[1:])
     if sub == "preparar-e-rodar":
         return cmd_preparar_e_rodar(argv[1:])
     if sub == "pendencias":

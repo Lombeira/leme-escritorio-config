@@ -35,3 +35,4 @@
 - [IDs das integrações](ids-das-integracoes.md) — cloudId do Jira leme-tec; appIds do Amplitude: 616682 prod, 617768 QA/DEV, 900256 Lovable
 - [Hook PermissionRequest na prática](permissionrequest-hook-comportamento.md) — corre em paralelo com o terminal; dispara no claude -p; SESSION_ATTENDED=1/0 separa os modos
 - [leme-app quebra no Node 26](leme-app-suite-quebra-no-node-26.md) — localStorage nativo x jsdom; usar 24 até o PR (c) das pendências
+- [Ouvidor: o que não sugerir](ouvidor-o-que-nao-sugerir.md) — motivos das sugestões do Slack que o time ignorou
