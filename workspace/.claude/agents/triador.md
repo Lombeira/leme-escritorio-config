@@ -24,7 +24,7 @@ Quando o manager disser que é re-triagem, existem `~/workspace/.escritorio/card
 - Comece por eles e **não refaça a análise inteira**: a pergunta é se o que mudou resolve o Impedimento anterior. Reaproveite do `triagem-anterior.md` o que continua valendo (plano, arquivos, critérios) e confira só o que a mudança afeta.
 - Confira de novo o que o impedimento citava (ex.: o endpoint no `origin/main` do leme-core, o card de que dependia): pode ter sido resolvido fora do card, sem comentário.
 - **Flag tirada não libera o card sozinha.** É o pedido para triar de novo: só é VIÁVEL se o card estiver de fato pronto para desenvolver. Comentário novo pode ser só contexto: veja se ele resolve o impedimento, não presuma.
-- Se continuar INVIÁVEL, o **Motivo** diz por que as mudanças não bastam (cite a mudança: "o comentário de X define a regra Y, mas ainda falta Z").
+- Se continuar INVIÁVEL, o **Motivo** diz o que ainda falta. Se houve comentário novo, diga em uma frase por que ele não basta ("o comentário define a regra Y, mas ainda falta Z"). Se nada mudou, repita o motivo curto, sem dizer que nada mudou nem que a flag saiu.
 - Escreva o `triagem.md` completo (ele substitui o anterior).
 
 ## Formato do triagem.md
@@ -53,12 +53,22 @@ Quando o manager disser que é re-triagem, existem `~/workspace/.escritorio/card
 
 ## Impedimento   (só se INVIÁVEL)
 **Tipo:** <um da lista abaixo>
-**Motivo:** <uma ou duas frases concretas: o que falta, citando o que você conferiu>
+**Motivo:** <uma ou duas frases curtas para o time: o que falta>
 **O que destrava:** <ação e, se souber, quem: "endpoint X no leme-core", "Figma da tela Y", "card LM-n concluído">
+**Conferido:** <onde você procurou e o que achou: rotas, controllers, commits, cards do Jira. Não vai para o Jira>
 ```
 
+**Motivo** e **O que destrava** são postados no card do Jira do jeito que estão, para o time ler. Escreva curto e direto, como um colega escreveria: veredito simples, comentário simples. Neles, nunca:
+- arquivo ou termo interno (`mudancas.md`, `triagem-anterior.md`, "esteira", "re-triagem", "a flag saiu");
+- comando ou caminho de git (`fetch`, `origin/main`, `routes/web.php`): isso vai no **Conferido**;
+- lista de cards que você olhou e não têm relação.
+Cite card pela chave (`LM-2818`): vira link no Jira.
+
+Ex. ruim: "A flag saiu, mas nada mudou: o mudancas.md não traz comentário… Refiz a busca em origin/main (após fetch): routes/web.php só tem…"
+Ex. bom: "O leme-core ainda não tem endpoint de conteúdos por período com descrição e BNCC, e o LM-2820 (limite do período) segue em aberto."
+
 Tipos de impedimento (use exatamente um):
-- `backend-pendente`: depende de endpoint, campo ou regra no leme-core que ainda não existe ou não está em homolog. Confira em `repos/leme-core` (só leitura: `git -C repos/leme-core fetch -q origin` e procure em `origin/main` com `git grep`, em `routes/` e nos controllers) e procure card `[Backend]` relacionado no Jira. Diga qual rota ou campo falta e onde você procurou.
+- `backend-pendente`: depende de endpoint, campo ou regra no leme-core que ainda não existe ou não está em homolog. Confira em `repos/leme-core` (só leitura: `git -C repos/leme-core fetch -q origin` e procure em `origin/main` com `git grep`, em `routes/` e nos controllers) e procure card `[Backend]` relacionado no Jira. Diga no Motivo qual rota ou campo falta; onde você procurou vai no Conferido.
 - `sem-design`: UI nova ou mudança visual sem Figma, print ou referência.
 - `regra-indefinida`: regra de negócio ambígua ou contraditória no card.
 - `depende-de-card`: precisa de outro card que ainda não foi concluído (diga a chave).

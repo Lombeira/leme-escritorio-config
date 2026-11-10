@@ -1513,6 +1513,12 @@ class Despachante:
                     interno["flag_por_esteira"] = True
                 escreve_json(caminho_interno(key), interno)
             self.fotografa_inviavel(key)
+            try:
+                vinculos = vincula_bloqueios(key)
+            except Exception as e:
+                vinculos = [f"falhou: {e!r}"]
+            if vinculos:
+                log(f"{key}: vínculos de bloqueio no Jira: {'; '.join(vinculos)}")
 
     def fotografa_inviavel(self, key):
         try:
@@ -2389,6 +2395,45 @@ def impedimento_de(key, est):
     return campos
 
 
+def chaves_bloqueio(key):
+    """Cards que destravam este, tirados só do 'O que destrava' do triagem.md (o Motivo cita até o épico)."""
+    destrava = impedimento_de(key, {}).get("destrava") or ""
+    return sorted(set(re.findall(r"\bLM-\d+\b", destrava)) - {key})
+
+
+def vincula_bloqueios(key):
+    """Triagem INVIÁVEL que cita card no 'O que destrava': vínculo Blocks (<outro> bloqueia <key>) no Jira.
+    Confere a direção relendo o card; se sair invertida, avisa no log em vez de seguir criando."""
+    chaves = chaves_bloqueio(key)
+    if not chaves:
+        return []
+    links = jira_req(f"issue/{key}?fields=issuelinks")["fields"].get("issuelinks") or []
+    ja = {(x.get("inwardIssue") or {}).get("key") for x in links if x.get("type", {}).get("name") == "Blocks"}
+    feitos = []
+    for outro in chaves:
+        if outro in ja:
+            feitos.append(f"{outro} já vinculado")
+            continue
+        try:
+            tipo = jira_req(f"issue/{outro}?fields=issuetype")["fields"]["issuetype"]["name"]
+        except Exception:
+            feitos.append(f"{outro} não encontrado")
+            continue
+        if tipo.lower() in ("epic", "épico"):
+            feitos.append(f"{outro} é épico, sem vínculo")
+            continue
+        # Medido em 09/11/2026: no POST o card que BLOQUEIA vai em inwardIssue (o contrário do que a doc sugere).
+        jira_req("issueLink", "POST", {"type": {"name": "Blocks"}, "inwardIssue": {"key": outro},
+                                       "outwardIssue": {"key": key}})
+        links = jira_req(f"issue/{key}?fields=issuelinks")["fields"].get("issuelinks") or []
+        certo = any(x.get("type", {}).get("name") == "Blocks" and (x.get("inwardIssue") or {}).get("key") == outro
+                    for x in links)
+        feitos.append(f"{outro} bloqueia {key}" if certo else f"ATENÇÃO: vínculo com {outro} saiu na direção invertida")
+        if not certo:
+            break
+    return feitos
+
+
 def comenta_jira(key, campos):
     try:
         cfg = le_env(CONFIG / "atlassian.env")
@@ -2402,15 +2447,23 @@ def comenta_jira(key, campos):
         """Trechos entre crases viram código no Jira (antes apareciam com as crases à mostra)."""
         nos = []
         for i, pedaco in enumerate(valor[:1500].replace("\\`", "`").split("`")):
-            if pedaco:
-                nos.append({"type": "text", "text": pedaco, **({"marks": [{"type": "code"}]} if i % 2 else {})})
+            if not pedaco:
+                continue
+            if i % 2:
+                nos.append({"type": "text", "text": pedaco, "marks": [{"type": "code"}]})
+                continue
+            for j, parte in enumerate(re.split(r"\b(LM-\d+)\b", pedaco)):  # chave de card vira cartão clicável
+                if j % 2 and parte != key:
+                    nos.append({"type": "inlineCard", "attrs": {"url": f"https://{site}/browse/{parte}"}})
+                elif parte:
+                    nos.append({"type": "text", "text": parte})
         return nos
 
     def par(rotulo, valor):
         return {"type": "paragraph", "content": [{"type": "text", "text": f"{rotulo}: ", "marks": [{"type": "strong"}]},
                                                  *com_codigo(valor)]}
     blocos = [{"type": "paragraph", "content": [{"type": "text", "text":
-               "🤖 Triagem automática da esteira Leme: este card não pode seguir agora."}]}]
+               "🤖 Triagem automática: este card ainda não pode seguir."}]}]
     if campos.get("tipo"):
         blocos.append(par("Tipo", campos["tipo"]))
     blocos.append(par("Motivo", campos["motivo"]))
