@@ -68,10 +68,10 @@ O card `PR-<n>` não é do Jira e não tem front nem QA. O despachante já deixo
 - Os anexos do card no Jira (PDF, imagens, mocks) já estão em `~/workspace/.escritorio/cards/<KEY>/anexos/`, baixados pelo despachante antes de você começar. Diga isso ao triador, ao front-dev e ao qa quando chamá-los.
 - Se um agente precisar de algo que só o humano tem (informação que não está no card nem nos anexos): `esteira-estado <KEY> <etapa> aguardando_humano --resumo "preciso de: <o quê, em uma linha>"` e pare. O humano responde e usa **Retomar**.
 
-## Ação `retomar` (card que deu erro, ou parado no front pedindo algo ao humano)
+## Ação `retomar` (card que deu erro, ou parado no front ou na triagem pedindo algo ao humano)
 
 O despachante já colocou o card de volta na etapa que falhou (vem no pedido: "Etapa a refazer"). Não volte para a triagem e não repita etapas anteriores: o que já foi feito (triagem.md, commits, qa.md) continua valendo.
-- `triagem`: siga a ação `triagem` a partir do passo 2 (chamar o triador).
+- `triagem`: siga a ação `triagem` a partir do passo 2 (chamar o triador). Exceção: se a triagem estava **parada esperando humano** porque você perguntou algo (resumo "preciso de: …") e o comentário do humano responde, não chame o triador de novo: `esteira-estado <KEY> front rodando --agente front-dev` e siga o ciclo front com a decisão do humano no pedido ao front-dev.
 - `front`: siga o ciclo front/qa desde o passo 1.
 - `qa`: siga o ciclo front/qa a partir do passo 2 (só o QA).
 - `validacao`: siga a seção Validação.
@@ -87,3 +87,12 @@ O card já chega em `devolvido` (registrado pelo despachante, com o comentário 
 - Jira é só leitura nesta versão. Se achar que vale comentar ou transicionar, escreva o texto proposto no pedido de validação para o humano aprovar.
 - Push e PR só na ação `aprovar`. Se uma trava bloquear, pare com `esteira-estado <KEY> <etapa> falhou --resumo "<o que bloqueou>"`. Nunca contorne.
 - Qualquer erro inesperado: `esteira-estado <KEY> erro falhou --resumo "<motivo>"` e pare. Nada de tentar de novo em loop.
+
+## Trabalho em cima da branch de outra pessoa (ex.: "rebase do PR da Feda")
+
+Branch de outra pessoa **nunca** é reescrita nem recebe push: rebase dela exige force push, que a trava barra, e não é nosso. Isso não é motivo para parar: o "rebase" acontece **na branch do card**.
+1. No worktree do card (branch criada de `origin/main`), traga os commits da outra branch reaplicados sobre a main: `git fetch origin <branch>` e `git cherry-pick <base>..origin/<branch>` (a base é o `git merge-base origin/main origin/<branch>`), resolvendo os conflitos. Se forem muitos commits pequenos com conflito em cadeia, prefira `git merge --squash origin/<branch>` e um commit só, citando a branch de origem na mensagem.
+2. Siga o ciclo normal (front, review, qa, validação). O push é o normal da branch do card, sem force.
+3. Na descrição do PR, diga que ele **substitui o #<n>** e que os commits vieram da branch de <pessoa>. Não feche, não comente e não edite o PR antigo: quem fecha é o humano.
+
+Plano que pede vários PRs em sequência: a esteira abre **um PR por card**. Faça o primeiro e diga, no resumo da validação, o que fica para os próximos.

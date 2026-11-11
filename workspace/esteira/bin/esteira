@@ -58,7 +58,7 @@ ETAPAS = {"fila", "triagem", "front", "review", "qa", "validacao", "pr", "conclu
 STATUS = {"rodando", "aguardando_humano", "concluido", "falhou"}
 TRANSICOES = {
     "fila": {"triagem", "erro"},
-    "triagem": {"inviavel", "front", "erro"},
+    "triagem": {"inviavel", "front", "erro", "fila"},  # fila só se parada esperando humano
     "front": {"review", "erro"},  # toda mudança do front passa pelo review
     "review": {"front", "qa", "erro", "devolvido", "fila"},  # devolvido/fila só se escalado
     "qa": {"front", "validacao", "erro", "devolvido", "fila"},  # devolvido/fila só se escalado
@@ -1008,16 +1008,16 @@ class Despachante:
             elif acao == "retomar":
                 # erro: refaz a última etapa do historico; front/aguardando_humano: o agente parou
                 # pedindo algo (ex.: anexo) e o humano já resolveu.
-                parado_no_front = est and est["etapa"] == "front" and est["status"] == "aguardando_humano"
-                alvo = est and ((est["etapa"] == "erro" and etapa_para_retomar(est)) or (parado_no_front and "front"))
+                parado = est and est["etapa"] in ("front", "triagem") and est["status"] == "aguardando_humano"
+                alvo = est and ((est["etapa"] == "erro" and etapa_para_retomar(est)) or (parado and est["etapa"]))
                 if ocupado or not alvo:
-                    self.rejeita(arq, f"retomar só vale para card em erro com etapa anterior conhecida "
-                                      f"({est and est['etapa']})")
+                    self.rejeita(arq, f"retomar só vale para card em erro ou parado esperando humano no front ou "
+                                      f"na triagem ({est and est['etapa']}/{est and est['status']})")
                     continue
                 extra = {"etapa": alvo}
             elif acao == "triagem":
                 reabrivel = est is None or est["etapa"] in ("inviavel", "erro", "concluido") or \
-                    (est["etapa"] in ETAPAS_ESCALAVEIS and est["status"] == "aguardando_humano")
+                    (est["etapa"] in ETAPAS_ESCALAVEIS + ("triagem",) and est["status"] == "aguardando_humano")
                 if ocupado or not reabrivel:
                     self.rejeita(arq, f"{key} já está na esteira ({est and est['etapa']})")
                     continue
@@ -1046,6 +1046,10 @@ class Despachante:
                 escreve_json(caminho_interno(key), interno)
             os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
             log(f"fila: {key} {acao} por {por} aceito")
+            if len(self.rodando) >= max_ativos() and acao != "triagem":
+                # Sem vaga: o card fica parado na mesma etapa; o escritório precisa ver que o clique pegou.
+                atualiza_campos(key, aguardando_vaga={"acao": acao, "por": por, "em": agora()})
+                log(f"{key}: {acao} aguardando vaga ({len(self.rodando)} de {max_ativos()} ocupadas)")
 
     def sugestao_da_fila(self, arq, p):
         acao, por = p.get("acao"), p.get("por")
@@ -1311,6 +1315,8 @@ class Despachante:
             self.dispara(key, pend)
 
     def dispara(self, key, pend):
+        if (le_json(caminho_estado(key)) or {}).get("aguardando_vaga"):
+            atualiza_campos(key, aguardando_vaga=None)
         try:
             if pend["acao"] == "aprovar":
                 transiciona(key, "pr", "rodando", resumo=f"aprovado por {pend['por']}", por_despachante=True)

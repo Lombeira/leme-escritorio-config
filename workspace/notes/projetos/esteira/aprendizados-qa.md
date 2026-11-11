@@ -114,3 +114,72 @@ nada novo (card só de CI; critérios por git grep, git diff e pnpm audit no wor
 - Arrastar avaliação: mouse.down/move em passos/up funciona (dnd); contador "1 AVALIAÇÕES" por etapa serve de asserção.
 - Banco de questões: `/dashboard/mapa/questions`; "Nova questão" e, no card, clicar e "Editar". "Adicionar alternativa" sai de 4 para 5 e some (máximo 5). Contar `getByText("Comentário (uso interno)")` = número de alternativas.
 - Capitão: `/dashboard/capitao-leme`, textarea "Pergunte ao Capitão…", input file para imagem; a resposta vem rápido.
+
+## LM-2884 (10/11/2026 14:15)
+
+# Aprendizados QA LM-2884
+
+- `/foto` abre com PROFESSOR logado, sem escolher escola. Modo "live" quando existe `navigator.mediaDevices.getUserMedia`; em Chromium headless existe.
+- Câmera: lançar o Chromium com `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` (vídeo verde, videoWidth 2480). `abrirNavegador` do kit não aceita args de launch: escrevi o login à mão (faltou `args` no kit). Depois do login, `addInitScript` vale para o próximo `goto`.
+- Negar câmera: sobrescrever `getUserMedia` com uma flag `window.__deny` que lança `DOMException("", "NotAllowedError")`; virar para false e clicar "Tentar novamente" prova o critério 4 sem reload.
+- QR no vídeo: `qrcode-generator` do node_modules do worktree gera a matriz em Node; no navegador, canvas 720x1024 + `captureStream(15)` no lugar do getUserMedia. Payload: `<origem minúscula>/F/E/<UUID sem hífen em maiúsculas>/<página>/<HASH>` (E = cartão-resposta, S = socio). Lido em poucos segundos e navega para `/foto/notas?...`.
+- `salvarPrint` com fullPage em tela recém-carregada saiu em branco uma vez (desktop, spinner): use `{ paginaInteira: false }` e espere ~500 ms.
+- Não foi criado dado em homolog.
+
+## LM-2822 (10/11/2026 14:28)
+
+# Aprendizados do QA (LM-2822)
+
+- Grade horária: rota `/dashboard/timetable?school=&year=&class=`. Aulas são `.rbc-event` (texto "07:00 – 07:50 / Disciplina / Professor"). Drawer: título "Alterar aula" / "Nova aula"; campos `getByLabel("Professor(a)")` (select nativo), "Dia da semana" (select), "Início"/"Fim" (input time), "Turma" (desabilitado na visão por turma); Disciplina é Menu do Chakra (clicar no botão e `menuitem`).
+- Visão por professor: botão "Por turma" -> menuitem "Por professor", depois "Selecione o Professor". Clicar em aula não abre nada nessa visão; só "Nova aula" abre o drawer, com professor travado.
+- API: `v2/years/{ano}/classes` lista as turmas; `v2/classes/{id}/classrooms` lista aulas (`classrooms`); `POST v2/classrooms` cria aula (`classId, dayOfWeek, startedAt, endedAt, subjectId, teacherId`). Regras do servidor: 422 "Professor já possui aula nesse horário" e 422 de sobreposição na mesma turma.
+- Tunada da Feda, ano `1210f4eb...`: turmas A de 1º/2º/3º ano (`d577aa27`, `142e514f`, `5c369e2e`), grade de 07:00 às 11:30 cheia, uma aula por professor por horário. Depois das 11:30 os professores ficam livres, bom para criar massa. Fernanda Guerra (`48f1107e`) tem Arte na turma `d577aa27` ter 11:30-12:00 (serve de conflito para o C6). Fábio Moreira (`db96d710`) está livre para virar "B".
+- Rota de troca em lote (`PUT v2/classes/{id}/subjects/{id}/teacher`) existe em homolog.
+- Toasts do Chakra aparecem duplicados no DOM; usar `new Set` ao ler `[role=status]`. Print logo após clicar no diálogo pega o fade-out.
+- Console tem sempre um `ERR_CONNECTION_REFUSED` (ruído do preview).
+- Massa criada: ver qa.md. A grade da turma `142e514f` foi alterada (Arte toda do Fábio Moreira, etc.).
+- Faltou no kit: helper de toast e de abrir aula da grade (deixei em qa-scripts/lib.mjs).
+
+## LM-2819 (10/11/2026 14:56)
+
+# Aprendizados do QA (LM-2819, rodada 2)
+
+- Dados criados em homolog (Tunada da Feda, turma AEE A `f0391ad6-...`): Helena Albuquerque `6cc5bc58-5991-49ba-b2c0-96b902652bf1` com 14 anotações "QA ..." (categorias 1, 2, 4, 5; de 15/07 a 05/11/2026; uma de 20/09 a 25/09 com data de término; duas em 30/10). Serve para qualquer teste de anotações/impressão. Marina Braga (turma AEE B) tem 3; os demais alunos das AEE têm 0.
+- Alunos da turma: `GET v2/classes/<turma>/students`. Anotações: `GET v2/annotations/student/<id>?perPage=100` (devolve array direto). Categorias: `GET v2/annotations/categories` (7 incluindo "Atendimento AEE"). Não existe `v2/students` por escola.
+- Criar anotação pela API: `POST /api/v2/annotations` com FormData (`categoryId`, `date` Y-m-d, `studentId`, `content`, `endDate` opcional), 200.
+- Abrir a ficha: `/dashboard/students?school&year&class`, clicar no nome, `getByRole("tab",{name:/Anotações/})`. Menu: botão "Mais ações das anotações", item "Imprimir anotações"; esperar o `menuitem` (`waitFor`) antes de checar visibilidade. Modal: `getByRole("dialog",{name:/Imprimir anotações/})`; checkboxes precisam de `{force:true}`; DateInput: `getByPlaceholder("dd/mm/aaaa")` com `click`, `fill("")`, `pressSequentially("dd/mm/aaaa")`, `blur`.
+- O modal fecha depois de gerar o PDF com sucesso: reabra para testar o cenário seguinte. Download: `page.waitForEvent("download")` junto do clique, `saveAs` em pasta própria (`downloads/`), `pdftotext -layout` e `pdftoppm` existem no servidor.
+- Ruído de console em homolog: ERR_CONNECTION_REFUSED do GrowthBook `/sub/` e do crazyegg.
+- Falta no kit: helper de download de PDF e de abrir a ficha do aluno.
+
+## LM-2801 (10/11/2026 16:29)
+
+# Aprendizados do QA (LM-2801)
+
+- Análise de frequência: o interruptor de "modo análise" fica no cabeçalho (`header [role=switch], label:has(input[type=checkbox])`, primeiro). NÃO persiste entre `page.goto`: clicar depois de cada carga.
+- Turma com faltas (só 2º Semestre, só Arte; 15 alunos): Escola teste da Feda `ebac582b-e871-4214-a916-0b38f59360ca`, ano `1de13c22-759e-4d5a-9e8e-160f81c46ea4`, "1º Ano A - Manhã" `bc5cbf7f-6e14-4f32-ac32-39fe1a83437e`. As turmas 2º Ano A (`34baec6b-...`) e 3º Ano B (`837485ed-...`) não têm faltas (servem para o estado sem faltas).
+- Matérias do ADMIN nessa turma: Aprofundamento, Arte, Artesanato, Artes Marciais, Capoeira, Educação Física, Matemática, Multidisciplinar (só Arte tem faltas). O PROFESSOR vê só Arte e Multidisciplinar e não tem faltas em nenhuma: falta massa para "nas suas aulas de {matéria}".
+- O PROFESSOR só tem turmas na Escola teste da Feda; ZEZE Salles, Melo Martins e Tunada da Feda vêm sem turma/ano habilitados para ele.
+- Popover do Chakra: `[role=dialog]` com botão "Entendi"; gatilho `button` "Como calculamos?" logo depois do título (xpath following). Menus do Chakra deixam vários `[role=menu]` vazios no DOM; filtrar os com texto.
+- Mapa V2: precisa escolher turma e período (menu mostra só "2º Semestre") para renderizar conteúdo.
+- Kit: faltou um helper para ligar o modo análise e escolher turma/matéria. Scripts reaproveitáveis em `cards/LM-2801/qa-scripts/` (`lib.mjs`, `gestao.mjs`, `mat.mjs`, `resto.mjs`).
+
+## Complemento (rodada 2)
+- Professor de teste na turma 1º Ano A - Manhã (Escola teste da Feda, turma bc5cbf7f-6e14-4f32-ac32-39fe1a83437e) leciona Arte (classroom 5b77b626-6d77-47ad-b8e6-a7dcdecedaec, terças) e Multidisciplinar (2dde8b34-ddd0-4512-a68b-ce8bf1379b38, segundas). Ver as aulas do dia: GET v2/classes/<turma>/absences/<yyyy-mm-dd> (422 em dia sem aula dele).
+- Lançar falta pela API: PATCH v2/classes/<turma>/absences/ com {date, studentId, classroomId, absent:true}, logado como PROFESSOR e só em dia com aula dele. Criada: Levi Ackerman Guerra Lomenha, 10/11/2026, Arte. Reversível com absent:false.
+- Scripts reaproveitáveis em cards/LM-2801/qa-scripts: dia2.mjs (aulas do dia), falta.mjs, c5.mjs.
+
+## LM-2885 (10/11/2026 18:10)
+
+# Aprendizados QA LM-2885
+
+- O preview 127.0.0.1:5301 pode estar fora do ar quando o QA começa. Subi `eval "$(fnm env)"; pnpm exec vite --host 127.0.0.1 --port 5301 --mode homolog` no worktree (nohup, log em /tmp) e funcionou. Não use `pkill -f "vite ..."` dentro da mesma chamada Bash: o padrão casa com o próprio shell e mata a chamada (exit 144).
+- Rota da Base: `/dashboard/knowledge-base`. Com `urlEscopo` (Tunada da Feda + turma AEE A) o escopo já vem pela URL. O `goto` do Playwright com `urlEscopo` já devolve URL absoluta (não concatenar com BASE).
+- As categorias da lista são recolhidas: para abrir um guia, digite o título em `getByPlaceholder("Procurar um assunto...")` e clique no texto exato. No mobile existem dois inputs com esse placeholder: use `.first()`.
+- Cartão do tour: `section` com "Passo N de M". Botão: "Me mostre como fazer" (button ou link).
+- Cadeado: `[aria-label="Sua rede não tem este módulo"]`. Só existe para módulo "gestao" (nenhum guia é "mapa"). Cenário sem gestão: `forcarFlags(page, {"restrict-to-map-only": true})` (12 cadeados em "frequência"). Sem AEE: `forcarFlags(page, {"is-aee-enabled": []})`.
+- Não há seletor de perfil na Base: a visão muda com o papel logado (ADMIN vê mais itens que PROFESSOR/DIRETOR).
+- Critério com cópia temporária do `knowledge-base.data.json`: o dev server recarrega ao salvar; use try/finally com cópia em /tmp para reverter. Id do artigo do Doc é derivado do título: para simular renome, troque `id` e `title`.
+- `pnpm check:tutorials` regrava `tutorials.status.json`, mas sem diferença no git. `pnpm knip` imprime o banner da API várias vezes e sai 0.
+- Ruído de console: ERR_CONNECTION_REFUSED de growthbook (SSE) e crazyegg.
+- Faltou no kit: helper para abrir artigo da Base por título e para subir o preview quando cai.
