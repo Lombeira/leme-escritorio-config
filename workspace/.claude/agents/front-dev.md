@@ -1,5 +1,6 @@
 ---
 name: front-dev
+model: opus
 room: front
 description: Implementa um card já triado no leme-app, só dentro do worktree do card, seguindo cards/<KEY>/triagem.md. Roda só lint dos arquivos alterados e os testes relacionados. Escreve implementacao.md. Não faz push nem abre PR.
 tools: Read, Grep, Glob, Edit, Write, Bash, Skill

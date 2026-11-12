@@ -183,3 +183,96 @@ nada novo (card só de CI; critérios por git grep, git diff e pnpm audit no wor
 - `pnpm check:tutorials` regrava `tutorials.status.json`, mas sem diferença no git. `pnpm knip` imprime o banner da API várias vezes e sai 0.
 - Ruído de console: ERR_CONNECTION_REFUSED de growthbook (SSE) e crazyegg.
 - Faltou no kit: helper para abrir artigo da Base por título e para subir o preview quando cai.
+
+## LM-2886 (11/11/2026 18:14)
+
+# Aprendizados do QA do LM-2886
+
+- **Flag nova sem GrowthBook:** `forcarFlags(page, { "is-mapa-analytics-gestao-enabled": [{id,name}] })` basta. Para o Mapa V2 de outra escola (ex.: Faino, que é V1 de verdade), force também `"is-mapa-v2-enabled": [...lerFlags()["is-mapa-v2-enabled"], escola]` e, para diretor, `IsMapaLemeEnabled`. Sem isso a Faino abre a tela V1 ("Visão de Analytics em construção").
+- **Modo análise:** o único `input[type=checkbox]` do header; `checked` = modo normal. Clique com `{force:true}` quando estiver marcado.
+- **Seleção de escola do admin:** ao abrir `/dashboard/mapa/pedagogical-map` aparece lista de botões com o nome da escola; clique nela.
+- **Preview de papel:** botão `getByLabel("Ferramentas internas")` (ícone de chave no topo da sidebar), itens "Professor(a)", "Coordenador(a)", "Diretor(a)", "SME". Depois de um preview o menu não reabriu de forma confiável: escolha um papel por sessão.
+- **Menus de filtro (BaseMenu do Chakra):** itens têm `role=menuitem`; Escape deixa o menu "aberto" sem estar visível, então clique fora (`mouse.click(1300,60)`) em vez de Escape.
+- **Eventos do Amplitude:** em dev o app faz `console.group("📊 <evento>")` + `console.table(props)`. No Playwright o tipo é `startGroup` e o `table` tem o objeto em `args()[0].jsonValue()` (formato `{prop:{valor,origem}}`). Não há POST para amplitude.com no preview.
+- **Dados:** Escola teste da Feda `ebac582b-e871-4214-a916-0b38f59360ca` tem 7 mapas, 55 provas e 14 turmas com resposta (endpoint `v2/analytics/learning-maps?schoolId=`); 16 provas com "Ainda não feito", 54,8% numa prova (laranja), 33% numa (vermelha). Nilva Cazeto (única escola do DIRETOR) = `e8893b5a-2222-4483-b6fd-6786a460ad05`, sem mapa (resposta real vazia). DIRETOR recebe 403 ao pedir escola alheia (ex.: Faino) direto na API.
+- **Cenários sem dado real** (sem respostas, 403, 80% com 40/30/2/8, turma com 0 respostas): `page.route(/v2\/analytics\/learning-maps(\?|$)/)` com `route.fetch()` e corpo alterado; está em `qa-scripts/c12.mjs`.
+- **Armadilha de ambiente:** um `python3` no meio do comando disparou a trava do hook e abortou o comando inteiro (o arquivo do heredoc anterior não foi criado). Não misturar python na mesma chamada.
+- **Kit:** faltam helpers para ligar o modo análise, escolher escola pelo picker e capturar eventos do console; estão em `qa-scripts/lib.mjs` deste card.
+
+## LM-2886 (11/11/2026 18:58)
+
+# Aprendizados do QA do LM-2886
+
+- **Flag nova sem GrowthBook:** `forcarFlags(page, { "is-mapa-analytics-gestao-enabled": [{id,name}] })` basta. Para o Mapa V2 de outra escola (ex.: Faino, que é V1 de verdade), force também `"is-mapa-v2-enabled": [...lerFlags()["is-mapa-v2-enabled"], escola]` e, para diretor, `IsMapaLemeEnabled`. Sem isso a Faino abre a tela V1 ("Visão de Analytics em construção").
+- **Modo análise:** o único `input[type=checkbox]` do header; `checked` = modo normal. Clique com `{force:true}` quando estiver marcado.
+- **Seleção de escola do admin:** ao abrir `/dashboard/mapa/pedagogical-map` aparece lista de botões com o nome da escola; clique nela.
+- **Preview de papel:** botão `getByLabel("Ferramentas internas")` (ícone de chave no topo da sidebar), itens "Professor(a)", "Coordenador(a)", "Diretor(a)", "SME". Depois de um preview o menu não reabriu de forma confiável: escolha um papel por sessão.
+- **Menus de filtro (BaseMenu do Chakra):** itens têm `role=menuitem`; Escape deixa o menu "aberto" sem estar visível, então clique fora (`mouse.click(1300,60)`) em vez de Escape.
+- **Eventos do Amplitude:** em dev o app faz `console.group("📊 <evento>")` + `console.table(props)`. No Playwright o tipo é `startGroup` e o `table` tem o objeto em `args()[0].jsonValue()` (formato `{prop:{valor,origem}}`). Não há POST para amplitude.com no preview.
+- **Dados:** Escola teste da Feda `ebac582b-e871-4214-a916-0b38f59360ca` tem 7 mapas, 55 provas e 14 turmas com resposta (endpoint `v2/analytics/learning-maps?schoolId=`); 16 provas com "Ainda não feito", 54,8% numa prova (laranja), 33% numa (vermelha). Nilva Cazeto (única escola do DIRETOR) = `e8893b5a-2222-4483-b6fd-6786a460ad05`, sem mapa (resposta real vazia). DIRETOR recebe 403 ao pedir escola alheia (ex.: Faino) direto na API.
+- **Cenários sem dado real** (sem respostas, 403, 80% com 40/30/2/8, turma com 0 respostas): `page.route(/v2\/analytics\/learning-maps(\?|$)/)` com `route.fetch()` e corpo alterado; está em `qa-scripts/c12.mjs`.
+- **Armadilha de ambiente:** um `python3` no meio do comando disparou a trava do hook e abortou o comando inteiro (o arquivo do heredoc anterior não foi criado). Não misturar python na mesma chamada.
+- **Kit:** faltam helpers para ligar o modo análise, escolher escola pelo picker e capturar eventos do console; estão em `qa-scripts/lib.mjs` deste card.
+
+## Rodada 2 (devolução da Feda)
+- **Preview pode estar morto no início da rodada** (nada em 5301, `ERR_CONNECTION_REFUSED`). `esteira-preview start <KEY>` sobe de novo na mesma porta em ~15 s.
+- **Escolher turma sem header:** com flag `[]` (ou professor), `abrirMapa` + clicar na escola pelo picker mostra `main button` com as turmas; o primeiro botão é a turma. Admin na Feda: 16 turmas; professor: 3 (1º Ano A, 2º Ano A, 3º Ano B manhã). Turma "1º Ano A - Manhã" da Feda = `bc5cbf7f-6e14-4f32-ac32-39fe1a83437e`.
+- **Referência de card da plataforma:** Conteúdos com turma escolhida e modo normal (`checked`); cards têm raio 12px, borda 1px rgb(226,232,240), sombra `rgba(15,23,42,.08) 0 2px 8px`, padding 20px. Chegar lá pelo picker do Mapa e pelo link "Conteúdos" (ir por URL perde a escola).
+- **Regiões roláveis:** `page.getByRole("region", {name: "Turmas da escola"})`, `.focus()` e ArrowDown rolam (scrollTop 0 para 120). Ler `document.activeElement.scrollTop` logo depois do Tab não funcionou; usar o locator. A partir de "Todos os mapas" são 1 Tab até a lista de Progresso e 2 até a de Turmas.
+- **Reuso:** `qa-scripts/r2-*.mjs` são cópias dos scripts da rodada 1 com prefixo r2- nos prints (sed no `salvarPrint`). Evitar `require` em .mjs (quebrou o log final do `filtros`).
+- **Kit:** ainda falta helper para "escolher escola pelo picker" e capturar eventos do console (`qa-scripts/lib.mjs`).
+
+## LM-2898 (11/11/2026 19:52)
+
+# Aprendizados do QA (LM-2898)
+
+- A flag `is-mapa-analytics-gestao-enabled` não existe no GrowthBook de homolog (`lerFlags()` devolve undefined). Use `forcarFlags(page, {"is-mapa-analytics-gestao-enabled":[{id:"ebac582b-e871-4214-a916-0b38f59360ca",name:"Escola teste da Feda"}]})` e abra `/dashboard/mapa/pedagogical-map?school=<id>`. O ano entra sozinho.
+- Modo análise: o switch no cabeçalho (`[role=switch],input[type=checkbox]`, `click({force:true})`). O toggle Turmas/Alunos é `getByText("Alunos",{exact:true}).last()`. Filtros são `Menu` do Chakra: `getByRole("button",{name:"Todos os anos"})` e depois `getByRole("menuitem")`.
+- Escola teste da Feda: 91 alunos em 16 turmas ("Aluno Cenário XX nn" e alunos com nome real na turma 1º Ano A). Elizabeth (`86032357-1e20-4c89-a541-cd13fbffea7e`, 1º Ano A) tem prova com `present:false` ("Faltou") e `present:null` ("Cartão não lido"): serve para o drawer. Nenhum aluno tem answers=0; use `page.route` e `route.fetch()` para alterar a resposta.
+- Mock de 403/404 precisa levar `statusCode` no corpo (`{statusCode:403,message}`): o interceptor do axios rejeita com o corpo, e sem isso a tela mostra a mensagem genérica. O core real devolve assim.
+- Eventos do Amplitude: o preview não tem chave, nada sai pela rede. O log fica no console (`startGroup` "📊 Nome" + `console.table`); leia com `m.args()[0].jsonValue()`.
+- Professor (Fernanda) na Escola teste da Feda, 1º Ano A: só tem dado com a trilha "Trilha Teste da Feda - V2" (a trilha padrão vem vazia). Troque pelo menu do filtro de mapa.
+- Alunos reentrando na aba refaz `learning-maps/students` (staleTime 0); isso não é o endpoint de visão geral.
+- Kit: faltou helper para o modo análise e para ler eventos de analytics do console.
+
+## LM-2896 (11/11/2026 20:38)
+
+# Aprendizados do QA (LM-2896)
+
+- A flag `is-mapa-analytics-gestao-enabled` não existe no CDN de homolog (lerFlags devolve undefined). Use `forcarFlags(page, {"is-mapa-analytics-gestao-enabled": [{id,name}]})` com a Escola teste da Feda (`ebac582b-...`). O hook é `useMapaAnalyticsGestaoSchools`.
+- Modo análise: clicar em `[data-tour="modo-analise"]` (click force). Para PROFESSOR, a URL ganha `analytics=1`; escolher a turma pelo botão do seletor na tela (ex.: "3º Ano B - Manhã").
+- Visão da gestão (ADMIN) em `/dashboard/mapa/pedagogical-map?school=<id>`: linhas de prova e de turma são `main button`; drawer é `getByRole("dialog")`; o botão X é o primeiro `button` do dialog.
+- Dados da Escola teste da Feda (via API `v2/analytics/learning-maps?schoolId=`): turmas 1º A `bc5cbf7f-6e14-4f32-ac32-39fe1a83437e` (tem 3 provas sem resposta e questões "sem presença": bom para "Sem resultados ainda"), 3º B `837485ed-d030-4731-8213-7bb87a36d596` (3 provas, todas com resposta). Prova parcial: "Leitura e Escrita · Nível Basilar · 1º Ano" (54%; turma A com 14 pendentes, turma C com 1 ausente). Nenhuma turma sem aluno ativo existe: para esse caso, `page.route` em `**/learning-maps/attendance*` zerando `students`.
+- 403/404 também por `page.route` (nenhum usuário ADMIN/DIRETOR de teste cai em turma de outra escola). Esses erros geram AxiosError no console: é esperado.
+- Faino (`41a3e682-...`) é Mapa V1: não tem a tela de habilidade/questão do professor V2. Para regressão do professor V2 usar a Escola teste da Feda.
+- Seletores com `getByRole("button").filter({hasText})` dão strict mode violation no drawer da turma (barras e questões repetem o nome da prova): filtrar também por "Escola" para a barra.
+- "Faltou" aparece em caixa alta por CSS; `innerText` devolve maiúsculo, regex precisa de `i`.
+- Perdi tempo com o modo análise e com seletores; o kit poderia ter `ligarModoAnalise(page)`.
+
+## LM-2901 (11/11/2026 20:51)
+
+# Aprendizados do QA (LM-2901)
+
+- Rota da Base de Conhecimento: `/dashboard/knowledge-base` (não `/base-de-conhecimento`, que dá "Não encontramos...").
+- `pnpm test scripts --run` falha (opção desconhecida); usar `CI=1 pnpm test scripts`.
+- Guia de tour: link "Como criar uma turma" (artigo `como-criar-turmas`, categoria "Turmas, horários e calendário"), botão "Me mostre como fazer" leva a /dashboard/classes. Funciona com ADMIN sem escola selecionada.
+- Mobile (390): abrir a lista com `getByLabel("Mostrar a lista")`, expandir a categoria com `getByRole("button", { name: "Turmas, horários e calendário" })` e clicar no guia.
+- Editar o JSON no teste: `knowledge-base.data.json` é `{title, categories:[{articles:[...]}]}`; o Vite recarrega sozinho. Reescrever com JSON.stringify gera diff enorme de formatação; restaurar com `git checkout` do arquivo e de `src/pages/knowledge-base/tutorials.status.json` (o check:tutorials reescreve).
+- `check:tutorials` sai 1 com Doc de 5 passos e com negrito inexistente; a mensagem fica antes da lista "Telas do menu sem tutorial", então não use `tail` curto.
+- Console tem sempre `ERR_CONNECTION_REFUSED` (recurso externo) na Base; ruído.
+- Faltou: um jeito de selecionar escola pelo kit para testar cadeado de módulo e AEE na Base; e uma instância de main para baseline.
+
+## LM-2904 (11/11/2026 22:05)
+
+nada novo
+
+## LM-2897 (11/11/2026 22:32)
+
+# Aprendizados QA LM-2897
+- A flag `is-mapa-analytics-gestao-enabled` NÃO existe no GrowthBook de homolog (lerFlags não a traz). Cenário se monta com forcarFlags(page, {"is-mapa-analytics-gestao-enabled":[S],"is-mapa-v2-enabled":[S],IsMapaLemeEnabled:[S]}) com S={id:"ebac582b-e871-4214-a916-0b38f59360ca",name:"Escola teste da Feda"}, logado como ADMIN. Depois ir a `/dashboard/mapa/pedagogical-map?school=<id>`.
+- Modo análise: clicar no switch do header (`header [role=switch]` com force:true).
+- Escola teste da Feda tem 72 células no heatmap (`button:has-text('questõ')`); a 12ª (EF01MA19, 58%, 3 questões) tem 4 turmas e 3 questões numa prova (bom para CA 2/3/4). A 1ª (5G1.7, 0%) tem 1 turma. Filtro Ano é menu (`menuitem` "1º Ano" = classLevelIds=8).
+- Professor (Fernanda Guerra) na Feda: 1º Ano A não tem resultado; "3º Ano B - Manhã" tem (célula 2LE1.2, questão com classId).
+- 404 do drawer: mockar com page.route e corpo {"statusCode":404,...}; sem `statusCode` no corpo cai na mensagem genérica (o interceptor rejeita com o corpo).
+- `ERR_CONNECTION_REFUSED` no console aparece sempre, em qualquer tela (ruído do ambiente).
+- Kit: faltaria um helper para ligar o modo análise e forçar flags de escola.

@@ -1,5 +1,6 @@
 ---
 name: reviewer-repo
+model: sonnet
 room: review
 description: Revisa o diff de um repo da Leme (leme-core, leme-assistant...) por UMA lente (correctness | reuse-architecture | readability), aplicando o checklist do repo em esteira/review/<repo>/checklist.md e as convenções do próprio repo. Só leitura; nunca edita nem posta.
 tools: Read, Grep, Glob, Bash

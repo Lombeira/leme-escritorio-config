@@ -65,7 +65,7 @@ TRANSICOES = {
     "validacao": {"pr", "devolvido", "erro"},
     "devolvido": {"front", "erro"},
     "pr": {"concluido", "erro"},
-    "inviavel": {"fila"},
+    "inviavel": {"fila", "concluido"},  # concluido: o time resolveu o card fora da esteira
     "erro": {"fila", "triagem", "front", "review", "qa", "validacao", "pr"},  # retomar: só o despachante
     "concluido": {"fila"},
 }
@@ -77,6 +77,22 @@ TRANSICOES_PR = {
     "review": {"validacao", "erro"},
     "validacao": {"concluido", "review", "erro"},
     "erro": {"review", "fila"},
+    "concluido": {"fila"},
+}
+# Atender review de PR (AR-<repo>-<n>): só repos de front. Saída da validação é do despachante
+# (aprovar = push + respostas; devolver = refazer; "não publicar" = encerra sem push).
+REPOS_ATENDER = {
+    "leme-app": {"install": ["pnpm", "install", "--frozen-lockfile"],
+                 "checks": "pnpm biome check <arquivos alterados> && pnpm tsc -p tsconfig.app.json --noEmit && pnpm test <relacionados>"},
+    "leme.tec.br": {"install": ["npm", "ci"], "checks": "npm run build"},
+}
+TRANSICOES_AR = {
+    "fila": {"front", "erro"},
+    "front": {"validacao", "erro"},
+    "validacao": {"pr", "devolvido", "concluido", "erro"},
+    "devolvido": {"front", "erro"},
+    "pr": {"concluido", "erro"},
+    "erro": {"fila", "front", "pr"},
     "concluido": {"fila"},
 }
 ETAPAS_ESCALAVEIS = ("review", "qa")  # aguardando_humano nelas = escalado; só sai por devolver ou triagem
@@ -97,7 +113,7 @@ STATUS_FIXO = {"inviavel": "aguardando_humano", "validacao": "aguardando_humano"
 ETAPAS_SEM_EDICAO = {"triagem", "review", "qa"}
 # Aprovação/devolução humana e entrada na fila: só o despachante, ao consumir um pedido da fila.
 RESERVADAS_DESPACHANTE = {("validacao", "pr"), ("validacao", "devolvido"), ("qa", "devolvido"),
-                          ("review", "devolvido")}
+                          ("review", "devolvido"), ("inviavel", "concluido")}
 
 ATLASSIAN_LEITURA = [
     "mcp__atlassian__getJiraIssue", "mcp__atlassian__searchJiraIssuesUsingJql",
@@ -291,12 +307,17 @@ def prepara_worktree(key):
 CONFIG_ESTEIRA = ESC / "config.json"
 
 
+SEM_LIMITE = 10**6
+
+
 def max_ativos():
-    """Vagas simultâneas, lidas a cada ciclo (mudar não exige reiniciar). Padrão: 2."""
+    """Vagas simultâneas, lidas a cada ciclo (mudar não exige reiniciar). Padrão: sem limite (decisão do Glauco,
+    11/11/2026); max_ativos com um número no config.json volta a limitar."""
+    valor = (le_json(CONFIG_ESTEIRA, {}) or {}).get("max_ativos")
     try:
-        return max(1, int((le_json(CONFIG_ESTEIRA, {}) or {}).get("max_ativos", 2)))
+        return max(1, int(valor)) if valor else SEM_LIMITE
     except (TypeError, ValueError):
-        return 2
+        return SEM_LIMITE
 
 
 def manager_vivo(key):
@@ -604,11 +625,129 @@ def publica_review_pr(key, comentarios=None, resumo=""):
     return True, json.loads(r.stdout).get("html_url") or est.get("pr_url"), recusados
 
 
+def valida_pedido_ar(p):
+    """(ok, motivo, dados) para atender review: só leme-app e leme.tec.br, PR aberto e do próprio repo."""
+    key, url, repo, numero = p.get("key"), p.get("url"), p.get("repo"), p.get("numero")
+    try:
+        numero = int(numero)
+    except (TypeError, ValueError):
+        return False, "numero do PR inválido", None
+    if repo not in REPOS_ATENDER:
+        return False, f"atender review só vale para {', '.join(REPOS_ATENDER)} (veio {repo!r})", None
+    if key != f"AR-{repo}-{numero}":
+        return False, f"key tem que ser AR-{repo}-{numero}", None
+    if url != f"https://github.com/leme-tech/{repo}/pull/{numero}":
+        return False, f"url tem que ser https://github.com/leme-tech/{repo}/pull/{numero}", None
+    r = subprocess.run(["gh", "pr", "view", str(numero), "-R", f"leme-tech/{repo}", "--json",
+                        "title,author,state,headRefName,isCrossRepository"], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return False, f"não achei o PR no GitHub: {r.stderr.strip()[:200]}", None
+    info = json.loads(r.stdout)
+    if info.get("state") != "OPEN":
+        return False, f"o PR está {info.get('state')}; só dá para atender review de PR aberto", None
+    if info.get("isCrossRepository"):
+        return False, "PR vindo de fork: a esteira não empurra para repositório de fora", None
+    branch = info.get("headRefName") or ""
+    if branch in ("main", "master") or not branch:
+        return False, f"branch do PR inválida ({branch!r})", None
+    autor = (info.get("author") or {}).get("login", "?")
+    return True, "", {"url": url, "repo": repo, "numero": numero, "branch": branch,
+                      "summary": f"Atender review: {info.get('title')} (de @{autor})"}
+
+
+def prepara_worktree_ar(key):
+    """Worktree na branch do PR (local com o mesmo nome do remoto, para o push normal), install e threads."""
+    est = le_json(caminho_estado(key)) or {}
+    repo, numero, branch = est.get("repo"), est.get("numero"), est.get("branch")
+    repo_dir = ROOT / "repos" / repo
+    wt = worktree(key)
+    git_repo = ["git", "-C", str(repo_dir)]
+    if subprocess.run(git_repo + ["fetch", "-q", "origin", branch], capture_output=True).returncode != 0:
+        return False, f"git fetch da branch {branch} falhou"
+    if not wt.exists():
+        r = subprocess.run(git_repo + ["worktree", "add", "-q", "-B", branch, str(wt), f"origin/{branch}"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, f"git worktree add falhou: {r.stderr.strip()[:200]}"
+        subprocess.run(["git", "-C", str(wt), "branch", "-q", f"--set-upstream-to=origin/{branch}"], capture_output=True)
+    else:
+        sujo = subprocess.run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=no"],
+                              capture_output=True, text=True).stdout.strip()
+        if not sujo:  # traz commits novos do autor do PR; com commit nosso ainda não enviado, o ff falha e fica como está
+            subprocess.run(["git", "-C", str(wt), "merge", "-q", "--ff-only", f"origin/{branch}"], capture_output=True)
+    inst = REPOS_ATENDER[repo]["install"]
+    if not (wt / "node_modules").exists():
+        r = subprocess.run(inst, cwd=wt, capture_output=True, text=True, timeout=1200,
+                           env={**os.environ, "PATH": path_com_node(wt)})
+        if r.returncode != 0:
+            return False, f"{' '.join(inst)} falhou: {(r.stderr or r.stdout).strip()[-200:]}"
+    ok, msg = busca_threads(key)
+    if not ok:
+        return False, msg
+    head = subprocess.run(["git", "-C", str(wt), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    return True, f"PR #{numero} de leme-tech/{repo} na branch {branch} (HEAD {head}); {msg}"
+
+
+def busca_threads(key):
+    """Threads de review NÃO resolvidas do PR em cards/<KEY>/threads.json (com o id do comentário para responder)."""
+    est = le_json(caminho_estado(key)) or {}
+    consulta = ('query($r:String!,$n:Int!){repository(owner:"leme-tech",name:$r){pullRequest(number:$n){'
+                'reviewThreads(first:100){nodes{id isResolved isOutdated path line originalLine '
+                'comments(first:50){nodes{databaseId author{login} body createdAt}}}}}}}')
+    r = subprocess.run(["gh", "api", "graphql", "-f", f"query={consulta}", "-f", f"r={est.get('repo')}",
+                        "-F", f"n={est.get('numero')}"], capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return False, f"não consegui ler as threads do PR: {r.stderr.strip()[:200]}"
+    nos = json.loads(r.stdout)["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    abertas = []
+    for t in nos:
+        if t.get("isResolved"):
+            continue
+        coms = t["comments"]["nodes"]
+        abertas.append({"thread": t["id"], "responder_a": coms[0]["databaseId"] if coms else None,
+                        "arquivo": t.get("path"), "linha": t.get("line") or t.get("originalLine"),
+                        "desatualizada": bool(t.get("isOutdated")),
+                        "comentarios": [{"autor": (c.get("author") or {}).get("login"), "texto": c.get("body"),
+                                         "em": c.get("createdAt")} for c in coms]})
+    escreve_json(CARDS / key / "threads.json", abertas)
+    return True, f"{len(abertas)} thread(s) não resolvida(s)"
+
+
+def posta_respostas(key, respostas):
+    """Responde cada thread com o texto exato aprovado. Retorna (postadas, falhas)."""
+    est = le_json(caminho_estado(key)) or {}
+    validos = {t["responder_a"] for t in le_json(CARDS / key / "threads.json", []) or [] if t.get("responder_a")}
+    postadas, falhas = [], []
+    for resp in respostas:
+        alvo, texto = resp.get("responder_a"), (resp.get("texto") or "").strip()
+        if not texto:
+            continue
+        if alvo not in validos:
+            falhas.append({"responder_a": alvo, "motivo": "comentário não é de uma thread aberta do PR"})
+            continue
+        r = subprocess.run(["gh", "api", "--method", "POST",
+                            f"repos/leme-tech/{est['repo']}/pulls/{est['numero']}/comments/{alvo}/replies",
+                            "-f", f"body={texto}"], capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            postadas.append(alvo)
+        else:
+            falhas.append({"responder_a": alvo, "motivo": (r.stderr or r.stdout).strip()[:200]})
+    return postadas, falhas
+
+
 def cmd_preparar_e_rodar(argv):
     """Roda no processo filho do despachante: prepara o worktree (triagem) e vira o claude -p."""
     key, acao, prompt = argv[0], argv[1], argv[2]
-    revisao_pr = (le_json(caminho_estado(key)) or {}).get("tipo") == "revisao_pr"
-    if acao in ("triagem", "retomar", "devolver") and not revisao_pr:
+    tipo_card = (le_json(caminho_estado(key)) or {}).get("tipo")
+    revisao_pr = tipo_card == "revisao_pr"
+    if tipo_card == "atender_review":
+        if acao in ("atender_review", "retomar", "devolver"):
+            ok, msg = prepara_worktree_ar(key)
+            print(f"preparo do atender review: {msg}", flush=True)
+            if not ok:
+                transiciona(key, "erro", "falhou", resumo=f"preparo do atender review: {msg}")
+                return 1
+    elif acao in ("triagem", "retomar", "devolver") and not revisao_pr:
         print(f"anexos: {baixa_anexos(key)}", flush=True)
     if revisao_pr and acao in ("revisar_pr", "retomar"):
         ok, msg = prepara_worktree_pr(key)
@@ -616,7 +755,7 @@ def cmd_preparar_e_rodar(argv):
         if not ok:
             transiciona(key, "erro", "falhou", resumo=f"preparo do worktree do PR: {msg}")
             return 1
-    elif acao in ("triagem", "retomar"):  # retomar reaproveita o worktree; só recria se sumiu
+    elif acao in ("triagem", "retomar") and tipo_card != "atender_review":  # retomar reaproveita; só recria se sumiu
         if acao == "triagem" and worktree(key).exists():
             print(f"worktree: {atualiza_worktree_triagem(key)}", flush=True)
         ok, msg = prepara_worktree(key)
@@ -664,13 +803,14 @@ def transiciona(key, etapa, status, agente=None, resumo=None, reprovado=False, p
                 est["tipo"] = tipo
         anterior = est["etapa"]
         revisao_pr = est.get("tipo") == "revisao_pr"
+        atender = est.get("tipo") == "atender_review"
 
-        tabela = TRANSICOES_PR if revisao_pr else TRANSICOES
+        tabela = TRANSICOES_PR if revisao_pr else TRANSICOES_AR if atender else TRANSICOES
         if etapa != anterior and etapa not in tabela.get(anterior, set()):
             raise TransicaoInvalida(f"transição {anterior} -> {etapa} não permitida"
                                     + (" (revisão de PR)" if revisao_pr else ""))
         sai_do_erro = anterior == "erro" and etapa != "erro"
-        reservada = (anterior, etapa) in RESERVADAS_DESPACHANTE or (revisao_pr and anterior == "validacao"
+        reservada = (anterior, etapa) in RESERVADAS_DESPACHANTE or ((revisao_pr or atender) and anterior == "validacao"
                                                                      and etapa != "validacao")
         if not por_despachante and (etapa == "fila" or sai_do_erro or reservada):
             raise TransicaoInvalida(f"{anterior} -> {etapa} só o despachante faz (pedido humano na fila)")
@@ -936,15 +1076,66 @@ class Despachante:
             self.atualiza_pendencias_da_fila(atualizar)
         for _, arq, p in sorted(pedidos, key=lambda x: x[0]):
             key, acao, por = p.get("key"), p.get("acao"), p.get("por")
-            if not key or acao not in ("triagem", "aprovar", "devolver", "retomar", "revisar_pr") or \
-                    por not in ("glauco", "feda"):
-                self.rejeita(arq, "campos obrigatórios: key, acao (triagem|aprovar|devolver|retomar|revisar_pr), "
-                                  "por (glauco|feda)")
+            if not key or acao not in ("triagem", "aprovar", "devolver", "retomar", "revisar_pr", "atender_review") \
+                    or por not in ("glauco", "feda"):
+                self.rejeita(arq, "campos obrigatórios: key, acao (triagem|aprovar|devolver|retomar|revisar_pr|"
+                                  "atender_review), por (glauco|feda)")
                 continue
             est = le_json(caminho_estado(key))
             ocupado = key in self.rodando
             extra = {}
-            if acao == "revisar_pr":
+            if acao == "atender_review":
+                ok_ar, motivo_ar, dados_ar = valida_pedido_ar(p)
+                if not ok_ar:
+                    self.rejeita(arq, motivo_ar)
+                    continue
+                if est and est.get("tipo") != "atender_review":
+                    self.rejeita(arq, f"{key} já existe na esteira com outro tipo")
+                    continue
+                if ocupado or (est and est["etapa"] not in ("concluido", "erro")):
+                    self.rejeita(arq, f"{key} já está na esteira ({est and est['etapa']})")
+                    continue
+                transiciona(key, "fila", "rodando", resumo="na fila", summary=dados_ar["summary"],
+                            por_despachante=True, tipo="atender_review")
+                atualiza_campos(key, tipo="atender_review", pr_url=dados_ar["url"], repo=dados_ar["repo"],
+                                numero=dados_ar["numero"], branch=dados_ar["branch"], respostas_postadas=None)
+            elif est and est.get("tipo") == "atender_review" and acao in ("aprovar", "devolver"):
+                if ocupado or est["etapa"] != "validacao":
+                    self.rejeita(arq, f"{acao} só vale para atender review em validacao")
+                    continue
+                comentario = (p.get("comentario") or "").strip()
+                if acao == "aprovar":
+                    respostas = p.get("respostas")
+                    if respostas is None:  # escritório sem edição: vale o que foi mostrado (respostas.json)
+                        respostas = [{"responder_a": r.get("responder_a"), "texto": r.get("texto")}
+                                     for r in le_json(CARDS / key / "respostas.json", []) or []]
+                    if not isinstance(respostas, list):
+                        self.rejeita(arq, "respostas tem que ser uma lista")
+                        continue
+                    with trava(key):
+                        interno = le_json(caminho_interno(key), {})
+                        interno["respostas_aprovadas"] = respostas
+                        interno["pendente"] = {"acao": "aprovar", "por": por, "comentario": comentario,
+                                               "em": p.get("em", agora())}
+                        escreve_json(caminho_interno(key), interno)
+                    log(f"fila: {key} aprovar por {por} aceito ({len(respostas)} resposta(s) para postar depois do push)")
+                elif comentario.lower().replace("ã", "a") == "nao publicar":
+                    transiciona(key, "concluido", "concluido", resumo=f"não publicado (decisão de {por})",
+                                por_despachante=True)
+                    log(f"{key}: atender review encerrado sem push, por {por}")
+                elif not comentario:
+                    self.rejeita(arq, "devolver exige comentario (o que refazer, ou 'não publicar')")
+                    continue
+                else:
+                    with trava(key):
+                        interno = le_json(caminho_interno(key), {})
+                        interno["pendente"] = {"acao": "devolver", "por": por, "comentario": comentario,
+                                               "em": p.get("em", agora())}
+                        escreve_json(caminho_interno(key), interno)
+                    log(f"fila: {key} devolver por {por} aceito")
+                os.replace(arq, PROCESSADOS / f"{agora()}-{arq.name}")
+                continue
+            elif acao == "revisar_pr":
                 ok_pr, motivo_pr, dados_pr = valida_pedido_pr(p)
                 if not ok_pr:
                     self.rejeita(arq, motivo_pr)
@@ -1346,6 +1537,11 @@ class Despachante:
                   f"Comentário do humano: {pend['comentario'] or '-'}. "
                   f"Worktree: {worktree(key)}. Siga as instruções do agente manager.")
         est_pr = le_json(caminho_estado(key)) or {}
+        if est_pr.get("tipo") == "atender_review":
+            prompt += (f" Atender review do PR {est_pr.get('pr_url')} (repo {est_pr.get('repo')}, branch "
+                       f"{est_pr.get('branch')}). Threads abertas em {CARDS / key / 'threads.json'}. Checks do repo: "
+                       f"{REPOS_ATENDER.get(est_pr.get('repo'), {}).get('checks')}. "
+                       "Siga a seção 'Ação atender_review' do manager.")
         if est_pr.get("tipo") == "revisao_pr":
             prompt += (f" Revisão de PR de terceiros: {est_pr.get('pr_url')} (repo leme-tech/{est_pr.get('repo')}, "
                        f"PR #{est_pr.get('numero')}). Foco pedido: {pend.get('foco') or '-'}. "
@@ -1395,11 +1591,28 @@ class Despachante:
             if (le_json(caminho_estado(key)) or {}).get("etapa") == "inviavel":
                 self.comenta_impedimento(key)
             est_fim = le_json(caminho_estado(key)) or {}
+            if est_fim.get("tipo") == "atender_review" and est_fim.get("etapa") == "concluido":
+                self.posta_respostas_aprovadas(key)
             if est_fim.get("tipo") == "revisao_pr" and est_fim.get("etapa") == "validacao":
                 try:
                     log(f"{key}: achados conferidos contra o diff do PR: {valida_achados(key)}")
                 except Exception as e:
                     log(f"{key}: não consegui conferir os achados: {e!r}")
+
+    def posta_respostas_aprovadas(self, key):
+        """Só depois do push (card concluído): responde as threads com o texto aprovado no escritório. Uma vez."""
+        with trava(key):
+            interno = le_json(caminho_interno(key), {})
+            respostas = interno.pop("respostas_aprovadas", None)
+            escreve_json(caminho_interno(key), interno)
+        if not respostas:
+            return
+        try:
+            postadas, falhas = posta_respostas(key, respostas)
+        except Exception as e:
+            postadas, falhas = [], [{"motivo": repr(e)}]
+        atualiza_campos(key, respostas_postadas=len(postadas), respostas_falhas=falhas or None)
+        log(f"{key}: {len(postadas)} resposta(s) postadas nas threads" + (f"; {len(falhas)} falharam" if falhas else ""))
 
     def registra_custo(self, key, arq_log):
         """Custo da execução (evento final do stream-json) e divisão por setor/agente e modelo.
@@ -1475,6 +1688,7 @@ class Despachante:
                     atualiza_campos(key, merged_em=quando)
                     est["merged_em"] = quando
                     log(f"{key}: PR mergeado em {quando}")
+                    self.ultima_retriagem = 0  # merge pode desbloquear inviável: checa já, sem esperar a hora
             interno = le_json(caminho_interno(key), {})
             if interno.get("flag_por_esteira") and est.get("etapa") not in ("inviavel", "fila", "triagem"):
                 ok, msg = marca_impedimento(key, False)  # a esteira tirou o impedimento que ela mesma pôs
@@ -1518,13 +1732,13 @@ class Despachante:
                 if flag_ok:
                     interno["flag_por_esteira"] = True
                 escreve_json(caminho_interno(key), interno)
-            self.fotografa_inviavel(key)
             try:
                 vinculos = vincula_bloqueios(key)
             except Exception as e:
                 vinculos = [f"falhou: {e!r}"]
             if vinculos:
                 log(f"{key}: vínculos de bloqueio no Jira: {'; '.join(vinculos)}")
+            self.fotografa_inviavel(key)  # depois dos vínculos: a foto precisa ver os bloqueadores recém-ligados
 
     def fotografa_inviavel(self, key):
         try:
@@ -1537,8 +1751,86 @@ class Despachante:
             interno["foto_inviavel"] = foto
             escreve_json(caminho_interno(key), interno)
 
+    def processa_depois(self):
+        """depois.json do manager: ao concluir o card (PR aberto), o que ficou para depois vira card no Jira."""
+        for arq in CARDS.glob("*/depois.json"):
+            key = arq.parent.name
+            est = le_json(caminho_estado(key)) or {}
+            if est.get("etapa") != "concluido" or not est.get("pr_url"):
+                continue
+            interno = le_json(caminho_interno(key), {})
+            feito = interno.get("depois") or {}
+            if feito.get("concluido") or feito.get("erro") == arq.stat().st_mtime:
+                continue
+            d = le_json(arq)
+            problema = valida_depois(d)
+            if problema:
+                log(f"{key}: cards para depois recusados: {problema}")
+                with trava(key):
+                    interno = le_json(caminho_interno(key), {})
+                    interno["depois"] = {**feito, "erro": arq.stat().st_mtime, "motivo": problema}
+                    escreve_json(caminho_interno(key), interno)
+                continue
+
+            class Grava(dict):
+                def __call__(g, campos):
+                    g.update(campos)
+                    with trava(key):
+                        it = le_json(caminho_interno(key), {})
+                        it["depois"] = {**(it.get("depois") or {}), **campos}
+                        escreve_json(caminho_interno(key), it)
+            grava = Grava(feito)
+            try:
+                keys = cria_cards_depois(key, d, grava)
+            except Exception as e:
+                log(f"{key}: cards para depois falharam no meio ({e!r}); tenta de novo no próximo ciclo")
+                continue
+            grava({"concluido": agora()})
+            criados = [{"key": keys[str(i)], "titulo": c["titulo"]} for i, c in enumerate(d["cards"])]
+            atualiza_campos(key, depois=criados)
+            log(f"{key}: o que ficou para depois virou {len(criados)} card(s): {', '.join(c['key'] for c in criados)}")
+            log(f"{key}: pendências atualizadas ({atualiza_pendencias()[1]})")
+
+    def processa_quebras(self):
+        """quebra.json escrito pela triagem: cria as partes no Jira uma vez só (ver executa_quebra)."""
+        for arq in CARDS.glob("*/quebra.json"):
+            key = arq.parent.name
+            interno = le_json(caminho_interno(key), {})
+            feito = interno.get("quebra") or {}
+            if feito.get("concluida") or feito.get("erro") == arq.stat().st_mtime:
+                continue
+            q = le_json(arq)
+            problema = valida_quebra(q)
+            if problema:
+                log(f"{key}: quebra recusada: {problema}")
+                with trava(key):
+                    interno = le_json(caminho_interno(key), {})
+                    interno["quebra"] = {**feito, "erro": arq.stat().st_mtime, "motivo": problema}
+                    escreve_json(caminho_interno(key), interno)
+                continue
+
+            class Grava(dict):
+                def __call__(g, campos):
+                    g.update(campos)
+                    with trava(key):
+                        it = le_json(caminho_interno(key), {})
+                        it["quebra"] = {**(it.get("quebra") or {}), **campos}
+                        escreve_json(caminho_interno(key), it)
+            grava = Grava(feito)
+            try:
+                keys = executa_quebra(key, q, grava)
+            except Exception as e:
+                log(f"{key}: quebra falhou no meio ({e!r}); tenta de novo no próximo ciclo")
+                continue
+            grava({"concluida": agora()})
+            partes = [{"key": keys[pt["id"]], "titulo": pt["titulo"]} for pt in q["partes"]]
+            atualiza_campos(key, quebra=partes)
+            log(f"{key}: quebrado em {len(partes) + 1} cards: {', '.join(p['key'] for p in partes)}")
+            log(f"{key}: pendências atualizadas ({atualiza_pendencias()[1]})")
+
     def checa_inviaveis(self):
-        """A cada retriagem_horas (1 h; só API do Jira, sem Claude): inviável com a flag tirada volta para a triagem."""
+        """A cada retriagem_horas (1 h; só API do Jira, sem Claude): inviável com a flag tirada volta para a triagem;
+        inviável que o time levou adiante no Jira vira concluido (resolvido fora)."""
         horas = (le_json(CONFIG_ESTEIRA, {}) or {}).get("retriagem_horas", 1)
         if not horas or agora() - getattr(self, "ultima_retriagem", 0) < horas * 3600:
             return
@@ -1558,7 +1850,14 @@ class Despachante:
                 log(f"{key}: re-triagem: leitura do Jira falhou ({e!r})")
                 continue
             if card["status"] not in JIRA_GERIDOS:
-                continue  # o time levou o card para outro status; não é mais da esteira
+                # O time levou o card adiante no Jira (Testando, Aguardando Release, Concluído...): resolvido fora.
+                resumo = f"resolvido fora da esteira (Jira: {card.get('status_nome')})"
+                try:
+                    transiciona(key, "concluido", "concluido", resumo=resumo, por_despachante=True)
+                    log(f"{key}: {resumo}")
+                except TransicaoInvalida as e:
+                    log(f"{key}: não marquei como resolvido fora: {e}")
+                continue
             foto = interno.get("foto_inviavel")
             if foto and "assignee" not in foto:  # foto de antes da proteção: base do responsável é agora
                 foto["assignee"] = card.get("assignee")
@@ -1584,7 +1883,11 @@ class Despachante:
                                         if _epoch_jira(c.get("updated") or c.get("created")) <= marca}}
             # Só a flag tirada dispara (comentário às vezes é só contexto). A foto não é atualizada enquanto
             # isso: comentários e descrição desde o veredito se acumulam e vão juntos no mudancas.md.
-            if not (foto.get("flag") and not card["flag"]):
+            # Foto de antes deste recurso: no veredito, todo bloqueador estava aberto (foi por isso o INVIÁVEL).
+            abertos_antes = foto.get("bloqueios_abertos", card.get("bloqueadores", []))
+            resolvidos = sorted(set(abertos_antes) - set(card.get("bloqueios_abertos", [])))
+            desbloqueado = bool(abertos_antes) and not card.get("bloqueios_abertos")
+            if not (foto.get("flag") and not card["flag"]) and not desbloqueado:
                 if not interno.get("foto_inviavel"):
                     with trava(key):
                         interno = le_json(caminho_interno(key), {})
@@ -1592,6 +1895,11 @@ class Despachante:
                         escreve_json(caminho_interno(key), interno)
                 continue
             motivos, delta = mudancas_desde(foto, card)
+            if desbloqueado:
+                motivos.insert(0, f"bloqueio resolvido: {', '.join(resolvidos)}")
+                delta = (f"## Bloqueio resolvido\n\nO que bloqueava este card saiu do desenvolvimento no Jira "
+                         f"(mergeado ou concluído): {', '.join(resolvidos)}. Confira se o que ele entregou destrava "
+                         f"mesmo este card.\n\n" + delta)
             pasta = CARDS / key
             (pasta / "mudancas.md").write_text(
                 f"# {key}: o que mudou desde o veredito INVIÁVEL\n\n" + delta, encoding="utf-8")
@@ -1639,6 +1947,8 @@ class Despachante:
                 self.varre_previews()
                 self.sincroniza_jira()
                 self.checa_inviaveis()
+                self.processa_quebras()
+                self.processa_depois()
             except Exception as e:  # o loop não pode morrer por um card ruim
                 log(f"erro no ciclo: {e!r}")
             time.sleep(10)
@@ -2497,7 +2807,7 @@ JIRA_NOME = {JIRA_DESENVOLVENDO: "Desenvolvendo", JIRA_REVISANDO: "Revisando Có
 
 
 def status_jira_desejado(est):
-    if est.get("tipo") == "revisao_pr":  # PR-<n> não é card do Jira
+    if est.get("tipo") in ("revisao_pr", "atender_review"):  # PR-<n> e AR-<repo>-<n> não são cards do Jira
         return None
     etapa = est.get("etapa")
     if etapa in ("triagem", "inviavel", "front", "devolvido"):  # triagem já é desenvolvimento; inviável fica com flag
@@ -2581,19 +2891,27 @@ def _epoch_jira(iso):
 
 
 def le_card_jira(key):
-    campos = jira_req(f"issue/{key}?fields=description,status,assignee,{JIRA_CAMPO_FLAG}")["fields"]
+    campos = jira_req(f"issue/{key}?fields=description,status,assignee,issuelinks,{JIRA_CAMPO_FLAG}")["fields"]
     coms = jira_req(f"issue/{key}/comment?maxResults=100&orderBy=created").get("comments", [])
+    bloqueadores = sorted({x["inwardIssue"]["key"] for x in campos.get("issuelinks") or []
+                           if (x.get("type") or {}).get("name") == "Blocks" and x.get("inwardIssue")})
+    # Bloqueador resolvido = saiu de Tarefas pendentes/Desenvolvendo/Revisando Código (mergeado ou concluído).
+    abertos = [b for b in bloqueadores
+               if (jira_req(f"issue/{b}?fields=status")["fields"].get("status") or {}).get("id") in JIRA_GERIDOS]
     for c in coms:
         c["_texto"] = adf_texto(c.get("body")).strip()
         c["_robo"] = c["_texto"].startswith("🤖")
     return {"descricao": adf_texto(campos.get("description")).strip(), "flag": bool(campos.get(JIRA_CAMPO_FLAG)),
             "status": (campos.get("status") or {}).get("id"), "comentarios": coms,
+            "status_nome": (campos.get("status") or {}).get("name"),
             "assignee": (campos.get("assignee") or {}).get("accountId"),
-            "assignee_nome": (campos.get("assignee") or {}).get("displayName")}
+            "assignee_nome": (campos.get("assignee") or {}).get("displayName"),
+            "bloqueadores": bloqueadores, "bloqueios_abertos": abertos}
 
 
 def foto_de(card):
     return {"descricao": card["descricao"], "flag": card["flag"], "assignee": card.get("assignee"),
+            "bloqueios_abertos": card.get("bloqueios_abertos", []),
             "comentarios": {c["id"]: c.get("updated") or c.get("created") for c in card["comentarios"]}, "em": agora()}
 
 
@@ -2627,7 +2945,11 @@ def atualiza_worktree_triagem(key):
     """Re-triagem: traz o worktree para a origin/main se estiver limpo e sem commit próprio (ff-only)."""
     wt = worktree(key)
     git = ["git", "-C", str(wt)]
-    if subprocess.run(git + ["fetch", "-q", "origin"], capture_output=True).returncode != 0:
+    for tentativa in range(4):  # dois cards re-triando juntos disputam a trava do repo no fetch
+        if subprocess.run(git + ["fetch", "-q", "origin"], capture_output=True).returncode == 0:
+            break
+        time.sleep(3 + 3 * tentativa)
+    else:
         return "git fetch falhou; triagem no worktree como está"
     if subprocess.run(git + ["status", "--porcelain", "--untracked-files=no"], capture_output=True,
                       text=True).stdout.strip():
@@ -2641,6 +2963,143 @@ def atualiza_worktree_triagem(key):
                            env={**os.environ, "PATH": path_com_node(wt)})
         return "atualizado para origin/main" + ("" if r.returncode == 0 else "; pnpm install falhou")
     return "atualizado para origin/main"
+
+
+# ---------- quebra de card grande (escopo maior que um PR) ----------
+# O triador escreve cards/<KEY>/quebra.json; quem cria no Jira é o despachante, com os campos do card original.
+MAX_PARTES_QUEBRA = 5
+
+
+def adf_linkifica(no, site, exceto=None):
+    """Chave LM-n em texto simples vira cartão clicável do Jira (menos a do próprio card)."""
+    if isinstance(no, list):
+        out = []
+        for n in no:
+            if isinstance(n, dict) and n.get("type") == "text" and not n.get("marks") and re.search(r"\bLM-\d+\b", n["text"]):
+                for j, parte in enumerate(re.split(r"\b(LM-\d+)\b", n["text"])):
+                    if j % 2 and parte != exceto:
+                        out.append({"type": "inlineCard", "attrs": {"url": f"https://{site}/browse/{parte}"}})
+                    elif parte:
+                        out.append({"type": "text", "text": parte})
+            else:
+                out.append(adf_linkifica(n, site, exceto))
+        return out
+    if isinstance(no, dict) and "content" in no:
+        return {**no, "content": adf_linkifica(no["content"], site, exceto)}
+    return no
+
+
+def valida_quebra(q):
+    if not isinstance(q, dict) or not isinstance(q.get("partes"), list) or not q["partes"]:
+        return "quebra.json sem partes"
+    if len(q["partes"]) > MAX_PARTES_QUEBRA - 1:
+        return f"mais de {MAX_PARTES_QUEBRA} partes no total"
+    if not (isinstance(q.get("este_card"), str) and q["este_card"].strip()):
+        return "falta este_card (o que fica no card original)"
+    ids = {"este"}
+    for i, pt in enumerate(q["partes"]):
+        if not isinstance(pt, dict) or not re.fullmatch(r"p\d", str(pt.get("id", ""))):
+            return f"parte {i + 1}: id deve ser p2, p3..."
+        if not re.match(r"^\[(Frontend|Backend)\] .{5,}", str(pt.get("titulo", ""))) or len(pt["titulo"]) > 120:
+            return f"parte {pt['id']}: título precisa de [Frontend]/[Backend] e até 120 caracteres"
+        if not (isinstance(pt.get("descricao"), str) and len(pt["descricao"].strip()) > 80):
+            return f"parte {pt['id']}: descrição curta demais"
+        dep = pt.get("depende_de") or []
+        if not isinstance(dep, list) or any(d not in ids for d in dep):
+            return f"parte {pt['id']}: depende_de só pode citar 'este' ou partes anteriores"
+        ids.add(pt["id"])
+    return None
+
+
+def campos_herdados(key):
+    """Campos de um card novo nascido de <key>: mesmo tipo, épico, labels, responsável, prioridade e sprint."""
+    orig = jira_req(f"issue/{key}?fields=issuetype,parent,labels,assignee,priority,customfield_10020,description")["fields"]
+    campos = {"project": {"key": "LM"}, "issuetype": {"id": orig["issuetype"]["id"]}, "labels": orig.get("labels") or []}
+    if orig.get("parent"):
+        campos["parent"] = {"key": orig["parent"]["key"]}
+    if orig.get("assignee"):
+        campos["assignee"] = {"accountId": orig["assignee"]["accountId"]}
+    if orig.get("priority"):
+        campos["priority"] = {"name": orig["priority"]["name"]}
+    sprint = next((x["id"] for x in orig.get("customfield_10020") or [] if x.get("state") == "active"), None) or sprint_ativa()
+    if sprint:
+        campos["customfield_10020"] = sprint
+    return campos, orig
+
+
+def executa_quebra(key, q, grava):
+    """Cria as partes no Jira (idempotente: grava cada key assim que nasce), anota o escopo no original e liga
+    os vínculos Blocks. Retorna o mapa id -> key."""
+    site = le_env(CONFIG / "atlassian.env")["ATLASSIAN_SITE"]
+    campos, orig = campos_herdados(key)
+    keys = dict(grava.get("keys") or {})
+    keys["este"] = key
+    for pt in q["partes"]:
+        if pt["id"] in keys:
+            continue
+        desc = (f"## Contexto\n\nParte de {key}, quebrado pela triagem automática porque não cabia num PR. "
+                f"A descrição de {key} continua sendo a referência completa.\n\n" + pt["descricao"].strip())
+        criado = jira_req("issue", "POST", {"fields": {**campos, "summary": pt["titulo"].strip(),
+                                                       "description": adf_linkifica(md_para_adf(desc), site)}})
+        keys[pt["id"]] = criado["key"]
+        grava({"keys": {k: v for k, v in keys.items() if k != "este"}})
+    if not grava.get("anotado"):
+        total = len(q["partes"]) + 1
+        linhas = "\n".join(f"- Parte {i + 2}: {keys[pt['id']]} · {pt['titulo'].strip()}"
+                           + (f" (depende de {', '.join(keys[d] for d in pt.get('depende_de') or [])})"
+                              if pt.get("depende_de") else "")
+                           for i, pt in enumerate(q["partes"]))
+        nota = (f"## Escopo deste card: parte 1 de {total}\n\nEste card ficou grande demais para um PR e foi quebrado "
+                f"pela triagem automática. Aqui fica só: {q['este_card'].strip()}\n\nAs outras partes viraram cards "
+                f"próprios, cada um com a sua chave no PR e nos commits:\n\n{linhas}\n\nO resto desta descrição "
+                f"continua sendo a referência comum das partes.\n")
+        atual = orig.get("description") or {"type": "doc", "version": 1, "content": []}
+        novo = {**atual, "content": adf_linkifica(md_para_adf(nota), site, key)["content"] + [{"type": "rule"}]
+                + (atual.get("content") or [])}
+        jira_req(f"issue/{key}", "PUT", {"fields": {"description": novo}})
+        grava({"anotado": True})
+    if not grava.get("vinculado"):
+        for pt in q["partes"]:
+            for d in pt.get("depende_de") or []:
+                # quem bloqueia vai em inwardIssue (medido em 09/11/2026)
+                jira_req("issueLink", "POST", {"type": {"name": "Blocks"}, "inwardIssue": {"key": keys[d]},
+                                               "outwardIssue": {"key": keys[pt["id"]]}})
+        grava({"vinculado": True})
+    return keys
+
+
+def valida_depois(d):
+    if not isinstance(d, dict) or not isinstance(d.get("cards"), list) or not d["cards"]:
+        return "depois.json sem cards"
+    if len(d["cards"]) > 4:
+        return "mais de 4 cards"
+    for i, c in enumerate(d["cards"]):
+        if not isinstance(c, dict) or not re.match(r"^\[(Frontend|Backend)\] .{5,}", str(c.get("titulo", ""))) \
+                or len(c["titulo"]) > 120:
+            return f"card {i + 1}: título precisa de [Frontend]/[Backend] e até 120 caracteres"
+        if not (isinstance(c.get("descricao"), str) and len(c["descricao"].strip()) > 80):
+            return f"card {i + 1}: descrição curta demais"
+    return None
+
+
+def cria_cards_depois(key, d, grava):
+    """O que ficou para depois num card concluído vira card próprio (idempotente por índice)."""
+    site = le_env(CONFIG / "atlassian.env")["ATLASSIAN_SITE"]
+    campos, _ = campos_herdados(key)
+    feitos = dict(grava.get("keys") or {})
+    for i, c in enumerate(d["cards"]):
+        if str(i) in feitos:
+            continue
+        desc = (f"## Contexto\n\nFicou para depois no {key} (registrado pela esteira ao concluir o card).\n\n"
+                + c["descricao"].strip())
+        nova = jira_req("issue", "POST", {"fields": {**campos, "summary": c["titulo"].strip(),
+                                                     "description": adf_linkifica(md_para_adf(desc), site)}})["key"]
+        feitos[str(i)] = nova
+        grava({"keys": feitos})
+        if c.get("depende_deste", True):
+            jira_req("issueLink", "POST", {"type": {"name": "Blocks"}, "inwardIssue": {"key": key},
+                                           "outwardIssue": {"key": nova}})
+    return feitos
 
 
 def atribui_se_vazio(key, por):

@@ -3,8 +3,10 @@ card: LM-2885
 status: fechado
 fechado_em: 2026-11-10 18:23 (aprovado)
 rodada: 1
+pr: https://github.com/leme-tech/leme-app/pull/881
 ---
 # LM-2885: validar a Base de Conhecimento com o Google Doc na frente (um PR só, substitui o #853)
+**PR:** https://github.com/leme-tech/leme-app/pull/881
 
 **Link:** http://192.168.1.173:5301/dashboard/knowledge-base. É o preview do worktree, com a API de homolog. Ele cai quando o card sai da validação ou depois de 24 h.
 - Worktree: `repos/leme-app/.worktrees/LM-2885`
