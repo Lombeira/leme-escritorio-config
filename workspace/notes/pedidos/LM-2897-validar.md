@@ -1,8 +1,12 @@
 ---
-status: aberto
+status: fechado
+fechado_em: 2026-11-12 08:55 (aprovado)
 card: LM-2897
+pr: https://github.com/leme-tech/leme-app/pull/887
 ---
 # LM-2897: validar
+
+**PR:** https://github.com/leme-tech/leme-app/pull/887
 
 **Preview:** http://192.168.1.173:5301/ (flag `is-mapa-analytics-gestao-enabled` não existe no GrowthBook de homolog: o QA a forçou no navegador; modo análise ligado em `/dashboard/mapa/pedagogical-map`, como diretor/coordenador)
 

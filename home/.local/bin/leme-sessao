@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Sessão própria (tmux + Claude) para cada pessoa, no mesmo workspace: uma conversa não interrompe a outra.
+# uso: leme-sessao feda | leme-sessao glauco      (sair sem fechar: Ctrl+b e depois d)
+# Os botões "Glauco" e "Feda" no topo do terminal chamam: leme-sessao --ir <quem> <cliente>
+ir_cliente=""
+if [ "${1:-}" = "--ir" ]; then ir_cliente="${3:-}"; shift; fi
+quem="${1:-}"
+case "$quem" in
+  feda)   nome="Fernanda Guerra (Feda)"; extra="Ela é dev de front da Leme e esposa do Glauco. Ao registrar algo em nome de quem pediu (por: no escritório, responsável), use feda." ;;
+  glauco) nome="Glauco"; extra="Ao registrar algo em nome de quem pediu (por: no escritório, responsável), use glauco." ;;
+  *) echo "uso: leme-sessao feda | leme-sessao glauco" >&2; exit 2 ;;
+esac
+if ! tmux has-session -t "$quem" 2>/dev/null; then
+  prompt="Quem está falando nesta sessão é $nome. $extra Se perguntarem quem é você ou quem está falando, considere isso; o resto do CLAUDE.md vale igual."
+  tmux new-session -d -s "$quem" -c "$HOME/workspace" "claude --append-system-prompt $(printf '%q' "$prompt"); exec bash -l"
+fi
+tmux source-file "$HOME/.config/leme/tmux-botoes.conf"
+if [ -n "$ir_cliente" ]; then exec tmux switch-client -c "$ir_cliente" -t "$quem"; fi
+if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "$quem"; else exec tmux attach -t "$quem"; fi

@@ -276,3 +276,68 @@ nada novo
 - 404 do drawer: mockar com page.route e corpo {"statusCode":404,...}; sem `statusCode` no corpo cai na mensagem genérica (o interceptor rejeita com o corpo).
 - `ERR_CONNECTION_REFUSED` no console aparece sempre, em qualquer tela (ruído do ambiente).
 - Kit: faltaria um helper para ligar o modo análise e forçar flags de escola.
+
+## LM-2903 (12/11/2026 11:07)
+
+# Aprendizados QA LM-2903
+- Base de Conhecimento: `/dashboard/knowledge-base`. Balão do tour: `[aria-label="Passo a passo na tela"]` (botões Próximo/Voltar/Sair/Concluir, texto "Passo N de M"). Botão "Me mostre como fazer" abre o tour e navega para a rota do guia.
+- PROFESSOR recebe "Esta função não é para o seu tipo de acesso" nos guias de coordenação; use ADMIN para o tour.
+- Celular (390): categorias vêm recolhidas; clicar o botão `/^Alunos\s*\d+$/` expande. O título da categoria é CSS uppercase (getByText exato em caixa alta falha).
+- Passar escola pela URL (`?school=`) basta para o tour; Tunada da Feda (AEE) mostra guias de AEE, ZEZE SALLES não.
+- ADMIN vê 9 guias em Alunos, PROFESSOR 7.
+- Cadeado: ícone `svg.lucide-lock`; não achei escola de teste sem gestão para exercitar.
+- Para comparar com main falta uma segunda instância do preview.
+
+## LM-2890 (12/11/2026 16:18)
+
+# Aprendizados QA LM-2890
+
+- Admin em `/dashboard/mapa/exams` (sem escola selecionada) já lista avaliações V2; não precisa de escopo na URL.
+- `GET v2/exams?per_page=100&page=1` via `api()` devolve `knowledgeGroups`. Casos prontos: "acacad" (só Linguagens, id 6075cd8e-a845-4030-8093-60a99451bd88), "Alvo 1 - Teste da Feda" (Linguagens, Matemática), "Teste 2" (Pendente, sem área, id 67e398d8-4572-48ef-b886-25171a691e78).
+- Busca: placeholder "Buscar por título da avaliação...". Colunas fixas Ações/Nome: comparar `getBoundingClientRect().left` do `th` e do `td` depois de rolar o contêiner com scrollLeft.
+- Kit: `abrirNavegador({largura:390,altura:844})` serve direto para o celular.
+
+## LM-2834 (12/11/2026 16:24)
+
+# Aprendizados QA LM-2834
+- Rotas do leme-core são `v2/...`: `GET v2/classes/{id}/students` lista alunos com `attributes`; `classes/{id}` sem v2 dá 404. Tela de alunos: `/dashboard/students?school=&year=&class=`, botão "Novo aluno", clicar no nome abre o drawer; aba "Pessoal" > "Editar dados pessoais"; salvar é "Salvar" (criar) / "Salvar alterações".
+- Selects do form de aluno são `select[name=hasX]` nativos; use `selectOption({label})`. Valor null aparece como "Selecione" (igual aos 8 antigos).
+- Criar aluno exige CPF válido, nome, nascimento, Número na chamada (selectOption index 1), Início da matrícula (dd/mm/aaaa); sexo e raça via getByLabel. Turma vem do escopo da URL.
+- Editar só o Complemento de aluno sem endereço dá 422 ("cidade obrigatória"): preencher o endereço inteiro (CEP, Rua, N°, Bairro, Cidade, UF).
+- Massa: aluno "QA LM2834 Teste 84765" (turma AEE A, Tunada da Feda) com booleanos variados; João Nogueira (`a1fb960e-d966-4d8e-bf14-af47677a001c`) é aluno com todos os atributos null.
+- Faltou no kit: helper de CPF válido e de captura de POST/PATCH.
+
+## LM-2891 (12/11/2026 19:56)
+
+# Aprendizados do QA (LM-2891)
+
+- O preview `:5301` pode estar fora do ar com o card em `etapa: erro`. Dá para subir `pnpm exec vite --host 127.0.0.1 --port 5391 --strictPort` no worktree (tem `.env` e `node_modules`) e apontar o `qa.json` para ele. Não use `pkill -f` com o texto do próprio comando: mata o shell da chamada (exit 144); guarde o PID.
+- Diagramador: `/dashboard/mapa/exams/:id/diagramador`. A capa é `.exam-cover`; a linha da área é `.exam-cover__subject` (some quando em branco). As questões resolvem uma a uma (`GET v2/question-bank-items/:id`): espere `!innerText.includes("indisponível")` e mais ~2,5 s, senão a capa sai incompleta. Remover questão: `aria-label="Remover questão"`. Adicionar: botão "Adicionar" > gaveta (checkbox na linha) > "Aplicar à avaliação". Editar na tela não grava até clicar Salvar. A aba da capa é "Capa" (role tab).
+- Criar avaliação por API (ADMIN): `POST v2/exams` com `{name, description, classLevelId: 12, stage: 4}` (12 = 5º Ano; stage: 1 Diagnóstica, 2 Basilar, 3 Intermediária, 4 Alvo); depois `POST v2/exams/:id/layout` com `header`/`page` copiados de um `GET .../layout` existente (ex.: `f5a8cbdf-49e2-48d9-af75-359b3325ffdc`) e `questions[{questionBankItemId, questionBankItemVersion:1, position, columnSpan:1, pageBreakBefore:false, hideSupportText:false, imageScalePercent:100, imageAlign:"center"}]`. Ambos dão 201. Não testei DELETE.
+- Banco de questões (homolog, 12/11/2026): só Arte (1 questão, área Linguagens), Língua Portuguesa (Linguagens) e Matemática (Matemática); nenhuma disciplina sem área. IDs: LP 5º Ano `65413c87-9f32-473d-81b8-217949fb2b10`, `665b19fd-d766-4600-9d28-3650601073bf`; Mat 5º Ano `3f8b2431-3312-4cb1-b023-f58a51b097fe`, `9959b2b6-c3de-4f07-95a8-677e02300998`; Arte `c81c86fb-9ede-479f-8e82-64990046690e`. `v2/subjects` lista Artesanato (id 26), mas sem questão no banco.
+- Simular dado que não existe: `context.route(/\/api\/v2\/(question-bank-items|exams)/, ...)` com `route.fetch()` e `route.fulfill({ response, json })` reescrevendo `subject.knowledgeGroup = null`. Funciona e não grava nada.
+- `/dashboard/mapa/exams/:id/imprimir` exige `learningMapId` + turma com alunos + emissão de cartões (trava a avaliação); sem isso a capa nunca tem questões. Teste de impressão precisa de mapa V2 com cartões já emitidos, ou de OK do Glauco para emitir em escola de teste.
+- Massa criada: avaliações "QA LM-2891 lp / lpmatarte / arte / mat" (5º Ano, Alvo); IDs em `cards/LM-2891/qa-scripts/exames.json`.
+- Kit: faltou helper para esperar o diagramador pronto e para interceptar/reescrever respostas da API.
+
+## LM-2927 (12/11/2026 20:07)
+
+# Aprendizados QA LM-2927
+- Link de suporte: `window.open` / `<a target=_blank>` para `api.whatsapp.com/send?phone=55011955031171&text=...`. Para ler: `context.route(/wa\.me|whatsapp\.com/, fulfill)` + `context.waitForEvent("page")`, depois `new URL(pop.url()).searchParams.get("text")`.
+- Na sidebar o item MenuLabels.Duvidas aparece como "Ajuda" (rodapé, abaixo de "Base de Conhecimento"). No desktop o menu do avatar só tem Perfil/Tema/Sair; "Ajuda" do avatar só existe no mobile (390): abrir com `.avatar-menu`.
+- `selectedSchool` só existe com `?school=` na URL ou após escolher no seletor do topo (ex.: `/dashboard/timetable`; a home não tem seletor). Seletor: botão "Selecione a escola" + campo `getByPlaceholder("Nome da escola")` (busca por "ã" funciona; "ç" e "&" não acham escola no admin).
+- Escolas: Escola teste da Feda `ebac582b-e871-4214-a916-0b38f59360ca`; EMEF Melo Martins `7447820d-02d3-4d6a-a2a3-d60453e71b0d` (professor); EMEI JOÃO SERRA HORAMOS FILHO `4a6b80ee-0487-4fc1-ae60-af38e205b437` (admin, tem acento).
+- Aviso "Esta função ainda não está liberada" da Base de Conhecimento: não consegui provocar com ADMIN + forcarFlags (`restrict-to-map-only`, `IsMapaLemeEnabled: []`). Falta uma conta secretario ou escola sem Mapa de teste; o kit também não tem papel SECRETARIO.
+- Perdi chamadas descobrindo seletores; um helper `capturarWhatsapp(context, acao)` no kit ajudaria.
+
+## LM-2888 (12/11/2026 20:14)
+
+# Aprendizados QA LM-2888
+
+- O preview indicado (5302) estava fora do ar. Alternativa: `cd <worktree> && ./node_modules/.bin/vite --host 127.0.0.1 --port 5392 --strictPort` (o `.env` do worktree já tem o proxy /api). Derrubar pelo PID (`ss -ltnp`); `pkill -f` com o texto do comando mata o próprio shell.
+- Banco de itens: rota `/dashboard/mapa/questions` (não `/questoes`). ADMIN acessa.
+- Selects da barra: `getByLabel("Filtrar por <matriz|disciplina|ano/série|dificuldade|status|autor|imagem>")`; `selectOption` funciona. Dificuldade: Fácil=1, Intermediária=2, Difícil=3.
+- API `GET /api/v2/question-bank-items?page=&perPage=12` devolve array puro (sem total): paginar até página curta. Homolog em 12/11/2026: 551 itens, 378 com imagem, 173 sem; Fácil: 103 (88 com imagem).
+- Contador "X de Y questões" = itens carregados (carrega 3 páginas sozinho), não o total do servidor.
+- Dois selectOption seguidos sem pausa perdem o primeiro filtro na URL; esperar ~3 s.
+- Faltou no kit: helper para subir/derrubar preview quando a porta não responde.

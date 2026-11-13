@@ -21,6 +21,7 @@ Toda mudança de etapa passa pelo comando `esteira-estado`, que valida a transi�
 ## Ciclo front/review/qa
 
 1. `esteira-estado <KEY> front rodando --agente front-dev` e chame o **front-dev** (com o motivo, se for volta: reprovação do QA, achados do review ou comentário humano).
+   - **Card empilhado** (o `triagem.md` tem `**Base:** <CHAVE> (branch <b>)`): na primeira ida ao front, antes de chamar o front-dev, e só se a branch do card ainda não tem commit próprio (`git log origin/main..HEAD` vazio): `git fetch origin <b>` e `git reset --hard origin/<b>` no worktree. Diga ao front-dev que o card começa em cima do código do <CHAVE>.
 2. **Review** (toda mudança do front passa por aqui, inclusive depois de reprovação do QA):
    - `esteira-estado <KEY> review rodando --agente reviewer --resumo "review: revisando o diff"`.
    - Rode a skill **`/review`** do leme-app sobre o worktree: `REPO` é o caminho absoluto `~/workspace/repos/leme-app/.worktrees/<KEY>` (não deixe a skill resolver pelo diretório atual, que é o workspace), o range é `origin/main...HEAD` mais o não commitado, e a base se atualiza com `git -C <REPO> fetch origin` (aqui o SSH funciona; ignore a instrução da skill de buscar por HTTPS com token). A skill despacha os subagentes `reviewer` e `review-validator`; não corrija nada.
@@ -35,8 +36,34 @@ Toda mudança de etapa passa pelo comando `esteira-estado`, que valida a transi�
 ## Validação
 
 1. Se houver critério [visual]: `esteira-preview start <KEY> --rede` (porta própria do card, anotada no estado como `preview_url`). Card só com critérios não visuais vai para validação sem preview; o humano valida pelo diff e pelas evidências.
-2. Crie `~/workspace/notes/pedidos/<KEY>-validar.md` com `status: aberto`, o link, o resumo do `implementacao.md` e o quadro do `qa.md`.
-3. `esteira-estado <KEY> validacao aguardando_humano --resumo "<o que validar>"`. Fim desta execução.
+2. **Antes do pedido, tire da branch os commits `chore: update knowledge base [kb]`** que o hook de post-commit põe sozinho (o texto da Base de Conhecimento vem do Google Doc e não pega carona no PR de outro assunto; card que é da própria Base de Conhecimento fica com o dele). A branch ainda não foi para o GitHub, então: `[kb]` no topo → `git reset --hard HEAD~1`; no meio → `git rebase --onto <kb>~1 <kb>` e, se o hook criar outro `[kb]` no topo durante o rebase, `git reset --hard HEAD~1`. Confira com `git diff --quiet origin/main HEAD -- src/constants/knowledge-base.data.json public/images/knowledge-base`.
+3. Crie `~/workspace/notes/pedidos/<KEY>-validar.md` **neste formato**. Quem lê é o Glauco ou a Feda, com pressa, no navegador: o topo diz como abrir e o que decidir, o meio é um roteiro de clique, e o técnico vai para o fim.
+```markdown
+---
+status: aberto
+card: <KEY>
+---
+# <KEY>: <o que mudou para quem usa, em uma linha>
+
+**Abrir:** <link do preview já na tela certa, com a rota e o escopo na URL>
+**Entrar com:** <sua conta | a conta de teste de <papel> do qa.env (nunca a senha)>
+**Celular:** F12 → ícone de celular → largura 390 (só se houver critério de celular)
+
+## Decida antes de aprovar
+- <cada item da seção Suposições do `triagem.md`, cada escolha que você ou o front-dev fizeram sem o card definir, e cada pendência (commit estranho na branch, should-fix aberto): o que ficou, a alternativa e o que custa trocar>
+
+## Como validar (uns <n> minutos)
+1. <ação concreta, com o nome exato do item na tela> → **deve aparecer:** <o resultado, com o texto da tela> (print: `evidencias/<x>.png`)
+2. ...
+
+## Não precisa conferir
+- <o que o QA já provou por comando ou que não se vê na tela (testes, grep, larguras)>
+
+## Detalhes técnicos
+<resumo do implementacao.md, quadro do qa.md, resultado do review, checks>
+```
+   Regras do roteiro: de 3 a 8 passos, um por comportamento que muda para o usuário; use **os mesmos dados que o QA usou** (coluna "Onde testei" do `qa.md`), para o humano achar na hora; cada passo diz o que fazer **e** o que deve aparecer; nada de nome de arquivo, componente ou variável no roteiro; inclua o caso de borda que o card pede (vazio, sem permissão, celular). Sem decisão pendente, a seção "Decida" sai.
+4. `esteira-estado <KEY> validacao aguardando_humano --resumo "<o que validar>"`. Fim desta execução.
 
 ### O que fica para depois vira card (você escreve, o despachante cria)
 
@@ -54,11 +81,12 @@ Se sobrou algo acionável que este PR não vai fazer (should-fix que passou do l
 ## Ação `aprovar`
 
 1. Confira com `gh pr list --head <branch> --state all` (chamada separada, leia antes de seguir) que não há PR para essa branch.
-2. O card já chega em `pr` (quem registra a aprovação humana é o despachante; você não muda essa etapa). Avise o escritório antes de cada passo, sem mudar a etapa: `esteira-estado <KEY> pr rodando --resumo "push: rodando a suíte"`.
+2. **Card empilhado** (`**Base:**` no `triagem.md`), antes do push: veja se o PR da base já foi mergeado (`gh pr view <branch-base> --json state`). Mergeado: `git fetch origin main && git merge --no-edit origin/main` (merge, nunca rebase de branch já enviada) e o PR vai para `main`. Ainda aberto: o PR vai com `--base <branch-base>`, e a descrição diz "empilhado sobre o #<n>; quando ele entrar, o GitHub troca a base para a main".
+3. O card já chega em `pr` (quem registra a aprovação humana é o despachante; você não muda essa etapa). Avise o escritório antes de cada passo, sem mudar a etapa: `esteira-estado <KEY> pr rodando --resumo "push: rodando a suíte"`.
    - **Nunca rode `git push` direto.** O pre-push roda a suíte inteira (~8 min), perto do limite de 10 min da sua ferramenta Bash, e uma conexão SSH parada morre calada. Use `esteira-push iniciar <KEY>` e depois `esteira-push esperar <KEY>` (bloqueia até 9 min); repita o `esperar` enquanto ele sair com código 2 ("ainda rodando"). Código 0 = branch no origin no HEAD local, conferido por `ls-remote`.
    - Código 1 com `tipo=rede`: tente **uma** vez mais (`iniciar` + `esperar`), com resumo "push: segunda tentativa (falha de rede)". Com `tipo=testes` ou `tipo=trava`, ou se a segunda tentativa falhar: `esteira-estado <KEY> pr falhou --resumo "<motivo em uma linha>"` e pare (o despachante converte em `erro` e o humano pode retomar só esta etapa).
-3. `esteira-estado <KEY> pr rodando --resumo "abrindo o PR"` e `gh pr create` com título `[<KEY>] <resumo>`, corpo seguindo o template do repo (resumo do implementacao.md, critérios e resultado do QA; screenshots opcionais) e pedindo review.
-4. `esteira-estado <KEY> concluido concluido --pr-url <url> --resumo "PR aberto: <url>"`, `esteira-preview stop <KEY>`, e feche o pedido: no frontmatter `status: fechado` e `pr: <url>`, e logo abaixo do título uma linha `**PR:** <url>`. O link do PR tem que ficar no estado (`--pr-url`), no resumo e no pedido.
+4. `esteira-estado <KEY> pr rodando --resumo "abrindo o PR"` e `gh pr create` com título `[<KEY>] <resumo>`, corpo seguindo o template do repo (resumo do implementacao.md, critérios e resultado do QA; screenshots opcionais) e pedindo review.
+5. `esteira-estado <KEY> concluido concluido --pr-url <url> --resumo "PR aberto: <url>"`, `esteira-preview stop <KEY>`, e feche o pedido: no frontmatter `status: fechado` e `pr: <url>`, e logo abaixo do título uma linha `**PR:** <url>`. O link do PR tem que ficar no estado (`--pr-url`), no resumo e no pedido.
 
 ## Ação `atender_review` (corrigir o que o review pediu num PR aberto)
 

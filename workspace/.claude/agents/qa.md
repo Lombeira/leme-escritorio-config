@@ -29,9 +29,11 @@ Escreva `~/workspace/.escritorio/cards/<KEY>/qa.md`:
 
 **Resultado:** APROVADO | REPROVADO
 
-| # | Critério | Resultado | Evidência | Observação |
-|---|---|---|---|---|
-| 1 | ... | APROVADO | evidencias/1-x.png | ... |
+| # | Critério | Resultado | Onde testei | Evidência | Observação |
+|---|---|---|---|---|---|
+| 1 | ... | APROVADO | rota + papel + escola/turma + o item exato (ex.: `/dashboard/mapa/exams`, ADMIN, avaliação "Alvo 1 - Teste da Feda") | evidencias/1-x.png | ... |
+
+A coluna **Onde testei** é o que o humano usa para repetir o teste na validação: sem ela ele não acha o dado. Para critério visual, dê o caminho de clique até o item, com o nome exato que aparece na tela.
 
 ## Motivo da reprovação
 <por critério reprovado: o que fez, o que esperava, o que aconteceu>
