@@ -341,3 +341,26 @@ nada novo
 - Contador "X de Y questões" = itens carregados (carrega 3 páginas sozinho), não o total do servidor.
 - Dois selectOption seguidos sem pausa perdem o primeiro filtro na URL; esperar ~3 s.
 - Faltou no kit: helper para subir/derrubar preview quando a porta não responde.
+
+## LM-2889 (13/11/2026 14:17)
+
+# Aprendizados QA LM-2889
+
+- Rota do Banco de questões: `/dashboard/mapa/questions` (não `/dashboard/questions`, que dá 404). ADMIN vê direto, sem escopo de escola.
+- Dados criados em homolog (ADMIN): questões "QA LM-2889 com ERER" (hoje sem tag) e "QA LM-2889 sem tag" (hoje com ERER), Rascunho v1, Maternal 2 / Educação Física / SAEB BNCC 5ED1.2. Buscar por "QA LM-2889" para achar. Tag ERER tem id 1 (`?tagId=1`).
+- Criar questão pela tela: Matriz, Disciplina e Descritor são react-select (ids `#matriz-select`, `#disciplina-select`, `#learning-target-select`): clicar no input e `ArrowDown` + `Enter` (`getByRole("option")` pega o `<option>` oculto do select nativo). Ano e Dificuldade são `<select>` nativos (`#ano-serie-select`, `#dificuldade-select`, `selectOption({index})`). Título via placeholder "A pintura"; enunciado e alternativas são 10 `[contenteditable]` (índice 0 texto base, 1 enunciado, depois alternativa/comentário alternados); marcar correta: `getByLabel("Marcar Alternativa A como correta").check({force:true})`.
+- Editar: card > drawer > "Editar" > "Salvar alterações" > diálogo "Deseja continuar?" (role `dialog`, não `alertdialog`) > "Confirmar".
+- Filtros: `getByLabel("Filtrar por tag")`, `getByLabel(/Filtrar por dificuldade/i)` (selects nativos); contador `getByText(/de \d+ questões/)`. Visão lista: botão com tooltip "Visualizar em lista".
+- O kit poderia ter um helper `criarQuestao`; o lib.mjs deste card (`qa-scripts/lib.mjs`) serve de base.
+
+## LM-2928 (13/11/2026 14:34)
+
+# Aprendizados QA (LM-2928)
+
+- Turma de teste: Escola teste da Feda `ebac582b-e871-4214-a916-0b38f59360ca`, ano `1de13c22-759e-4d5a-9e8e-160f81c46ea4`, 1º Ano A `bc5cbf7f-6e14-4f32-ac32-39fe1a83437e` (PROFESSOR). Mapa "Trilha Teste da Feda - V2" (`17a81553...`): Linguagens 14 alunos (5/5/4 por faixa), Matemática 7 abaixo de 50%. Nenhum aluno sem nota, nenhuma habilidade com mais de 2 questões abaixo de 50% ou acima de 70% (varredura da API em qa-scripts/d8.mjs). Faltam dados para "retomar", "domina" e "quem não fez".
+- Analytics da turma: URL com school/year/class, depois clicar `[data-tour=modo-analise]`. A trilha padrão ("Trilha de Alfabetização") é vazia; trocar para "Trilha Teste da Feda - V2" no segundo seletor.
+- Player de vídeo: marcadores das cenas são botões pelo nome (Turma, Como foi, ...). Pausar e saltar deixa animações paradas (mostra "0%" ou cena vazia); espere tocando uns 4 s antes de ler/printar.
+- Visão da escola (gestão) não abre para ADMIN sem a flag: `forcarFlags(page, {"is-mapa-analytics-gestao-enabled":[{id:ESC,name:"..."}]})` (a flag não aparece em lerFlags). Abas "Turmas/Alunos/Correção/Vídeo" são texto, não role=tab.
+- Tema escuro: `context.addInitScript` com localStorage `chakra-ui-color-mode=dark` antes da navegação (recarregar depois quebra o estado do seletor).
+- Amplitude não aparece como POST na rede do navegador; critério de evento fica por teste/código.
+- Faltou no kit: helper de "entrar no analytics da turma" e de tocar/pausar o player.

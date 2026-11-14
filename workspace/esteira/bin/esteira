@@ -190,6 +190,16 @@ def env_systemd():
     return env
 
 
+def env_claude():
+    """Ambiente dos claude -p da esteira. Com --agent, o Agent tool lança subagente em segundo plano e
+    esse subagente morre aos 600 s (medido em 13/11/2026: 10 de 10 travas "terminou sem fechar a etapa");
+    em primeiro plano o manager espera o tempo que for."""
+    env = env_systemd()
+    env["ESTEIRA_HEADLESS"] = "1"  # o guard nega (em vez de perguntar) quando não há humano
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    return env
+
+
 def foto_versionados(key):
     """HEAD + diff dos versionados + git status (pega arquivo NOVO; respeita .gitignore e o
     info/exclude, onde ficam os artefatos de teste). Usado para provar que triagem/qa não editaram."""
@@ -433,8 +443,10 @@ def cmd_push(argv):
                # a trava global de pre-push vale mesmo com o hooksPath local do Husky
                "--setenv=GIT_CONFIG_COUNT=1", "--setenv=GIT_CONFIG_KEY_0=core.hooksPath",
                f"--setenv=GIT_CONFIG_VALUE_0={HOME}/.local/share/leme-git-guard",
-               "bash", "-c", 'git push -u origin "$1" > "$2" 2>&1; echo $? > "$3"', "push",
-               branch, str(log_push), str(rc_push)]
+               # uma suíte do pre-push por vez: 5 em paralelo em 4 CPUs levaram 40 min e estouraram timeout
+               "bash", "-c", 'echo "na fila do push desde $(date +%T)" > "$2"; '
+                             'flock "$4" git push -u origin "$1" >> "$2" 2>&1; echo $? > "$3"', "push",
+               branch, str(log_push), str(rc_push), str(ESC / "push.lock")]
         r = subprocess.run(cmd, env=env_systemd(), capture_output=True, text=True)
         if r.returncode != 0:
             print(f"{key}: não consegui iniciar o push: {r.stderr.strip()}", file=sys.stderr)
@@ -447,6 +459,10 @@ def cmd_push(argv):
     while not rc_push.exists() and time.time() < limite:
         time.sleep(5)
     if not rc_push.exists():
+        log_atual = log_push.read_text(errors="replace") if log_push.exists() else ""
+        if log_atual.count("\n") <= 1 and log_atual.startswith("na fila do push"):
+            print(f"{key}: push na fila (outro card está rodando a suíte do pre-push); rode esperar de novo")
+            return 2
         print(f"{key}: push ainda rodando (a suíte do pre-push demora); rode esperar de novo")
         return 2
     rc = rc_push.read_text().strip()
@@ -1316,8 +1332,7 @@ class Despachante:
                "--disallowedTools", ",".join(PROIBIDAS + ["Bash", "Edit", "Agent"]),
                "--output-format", "stream-json", "--verbose", prompt]
         f = open(arq_log, "w", encoding="utf-8")
-        env = env_systemd()
-        env["ESTEIRA_HEADLESS"] = "1"
+        env = env_claude()
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         self.ouvidor = (proc, agora(), f, lote)
         log(f"ouvidor disparado com {len(lote)} entrada(s), pid {proc.pid}")
@@ -1379,8 +1394,7 @@ class Despachante:
                "--allowedTools", "Read,Glob,Grep,Write", "--disallowedTools", ",".join(PROIBIDAS + ["Bash", "Edit"]),
                "--output-format", "stream-json", "--verbose", prompt]
         f = open(arq_log, "w", encoding="utf-8")
-        env = env_systemd()
-        env["ESTEIRA_HEADLESS"] = "1"
+        env = env_claude()
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         self.redatores[nid] = (proc, agora(), f, pasta)
         log(f"novo {nid}: redator disparado, pid {proc.pid}")
@@ -1549,8 +1563,7 @@ class Despachante:
         arq_log = LOGS / f"{key}-{agora()}-{pend['acao']}.log"
         cmd = [sys.executable, "-I", str(Path(__file__).resolve()), "preparar-e-rodar", key, pend["acao"], prompt]
         f = open(arq_log, "w", encoding="utf-8")
-        env = env_systemd()
-        env["ESTEIRA_HEADLESS"] = "1"  # o guard nega (em vez de perguntar) quando não há humano
+        env = env_claude()
         env["ESTEIRA_CARD"] = key  # o hook de permissão diz ao escritório de qual card é o pedido
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, start_new_session=True,
                                 env=env)
