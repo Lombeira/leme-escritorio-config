@@ -1,9 +1,12 @@
 ---
 status: fechado
+pr: https://github.com/leme-tech/leme-app/pull/894
 fechado_em: 2026-11-12 17:19 (aprovado)
 card: LM-2890
 ---
 # LM-2890: a lista de avaliações V2 ganha a coluna "Área do conhecimento"
+
+**PR:** https://github.com/leme-tech/leme-app/pull/894
 
 **Abrir:** http://192.168.1.173:5301/dashboard/mapa/exams
 **Entrar com:** sua conta (o QA usou ADMIN)

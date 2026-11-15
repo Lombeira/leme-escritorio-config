@@ -1,38 +1,41 @@
 ---
-status: aberto
+status: fechado
+pr: https://github.com/leme-tech/leme-app/pull/895
+fechado_em: 2026-11-14 16:22 (aprovado)
 card: LM-2889
 ---
-# LM-2889: o banco de questões ganhou o campo Tags (ERER) no formulário, nos cards, na lista, no detalhe e no filtro
+# LM-2889: Banco de questões ganha a tag "ERER" (cadastro, listagem, detalhe e filtro)
+
+**PR:** https://github.com/leme-tech/leme-app/pull/895
 
 **Abrir:** http://192.168.1.173:5302/dashboard/mapa/questions
-**Entrar com:** a conta de teste de administrador do qa.env (nunca a senha)
+**Entrar com:** a conta de teste de ADMIN do qa.env (ou a sua, se tiver acesso ao Banco de questões)
+**Celular:** não se aplica (banco de questões é desktop)
 
 ## Decida antes de aprovar
-- **Campo Tags como checkbox:** hoje o cadastro só tem a tag ERER, então usei checkbox (multi-seleção). Alternativa: select de valor único. Trocar custa pouco, mas mexe em formulário e testes.
-- **Detalhe sem tag mostra "Sem tags"** em vez de esconder o campo. Esconder é trivial de trocar.
-- **Texto do aviso de versão:** o aviso ao salvar agora diz "Alterações numa questão publicada, exceto nas tags, criam uma nova versão dela", porque mudar só a tag não cria versão. Não detectei "só tag" no front, pois quem decide é o backend.
-- **Texto antigo (já existia):** o aviso diz "questão publicada" mesmo para rascunho. Não mexi.
+- O card não dizia onde ficava a tag. Escolhi: no formulário, um bloco "Tags" com caixinha "ERER" abaixo de Dificuldade (como só existe ERER, não é select). Alternativa: select de valor único. Trocar custa pouco.
+- Chip "ERER" nos cards e coluna "Tags" na lista; no detalhe, "Sem tags" quando vazio.
+- Filtro "Tag" é de valor único, depois de "Autor".
+- Mudar só a tag **não cria nova versão**; os textos de edição agora dizem isso ("exceto nas tags").
 
-## Como validar (uns 8 minutos)
-1. Clique em **Nova questão** → **deve aparecer:** o campo "Tags" abaixo de Dificuldade, com a opção "ERER" (print: `evidencias/1-form-nova-questao.png`)
-2. Preencha os campos obrigatórios (ex.: Maternal 2, Educação Física, Fácil), marque ERER e salve → **deve aparecer:** o card da questão com o chip "ERER"; ao abrir, "Tags: ERER" (print: `evidencias/6a-detalhe-erer.png`)
-3. Em Editar nessa questão, desmarque ERER e salve → **deve aparecer:** "Sem tags" no detalhe e checkbox desmarcado ao reabrir a edição (print: `evidencias/3a-detalhe-apos-remover.png`)
-4. Numa questão sem tag, Editar, marque só ERER e salve → **deve aparecer:** ERER no detalhe e a versão continua "Versão 1" (print: `evidencias/4-detalhe-tag-adicionada-v1.png`)
-5. Troque para a visão em lista → **deve aparecer:** coluna "Tags" depois de Dificuldade, com o chip ou vazia (print: `evidencias/5-listagem-lista.png`)
-6. Na barra de filtros, escolha "Tag" = ERER (fica depois de "Autor") → **deve aparecer:** só questões com ERER e o contador "1 de 1 questões"; voltar para "Tag" vazio traz "24 de 24" (print: `evidencias/7a-filtro-tag-erer.png`)
-7. Combine Tag = ERER com Dificuldade → **deve aparecer:** resultado respeitando os dois (Fácil: 1; Difícil: 0)
-8. Crie uma questão sem marcar tag → **deve aparecer:** "Questão criada com sucesso.", sem erro
-
-Dados de teste em homolog: "QA LM-2889 com ERER" e "QA LM-2889 sem tag" (rascunhos).
+## Como validar (uns 5 minutos)
+1. Banco de questões → **Nova questão** → **deve aparecer:** bloco "Tags" com a caixa "ERER" abaixo de Dificuldade (print: `evidencias/r2-1-form-tags.png`)
+2. Preencha os campos, marque ERER e salve → **deve aparecer:** a questão na lista com o chip "ERER" (print: `evidencias/r2-2a-form-erer.png`, `evidencias/r2-5a-cards.png`)
+3. Abra a questão → **deve aparecer:** "Tags: ERER" (print: `evidencias/r2-6a-detalhe-erer.png`)
+4. Editar a questão, desmarque ERER, salve e confirme → **deve aparecer:** "Sem tags" no detalhe (print: `evidencias/r2-3c-detalhe-sem-tag.png`)
+5. Editar uma questão sem tag, marque só ERER e salve → **deve aparecer:** a tag no detalhe e a versão continua a mesma (ex.: "Versão 1") (print: `evidencias/r2-4b-detalhe-tag-v1.png`)
+6. Troque para a visão em lista → **deve aparecer:** coluna "Tags" com ERER, vazia nas questões sem tag (print: `evidencias/r2-5b-lista.png`)
+7. Nos filtros, escolha **Tag = ERER** → **deve aparecer:** só questões com ERER e o contador "X de Y questões" ajustado; limpar o filtro volta à lista completa (prints: `evidencias/7a-filtro-tag-erer.png`, `7b-filtro-tag-limpo.png`)
+8. Combine Tag = ERER com Dificuldade → **deve aparecer:** só as que atendem aos dois (prints: `evidencias/8a-...`, `8b-...`)
+9. Crie uma questão sem marcar tag → **deve aparecer:** "Questão criada com sucesso." (sem erro)
 
 ## Não precisa conferir
-- Que tag não entra na checagem de metadados incompletos nem exige o campo (testes cobrem).
-- Evento de analytics `filter_applied` com `filter_name: tag` (teste unitário).
-- Celular: banco de questões é desktop, não testado.
+- Combinação Tag + Disciplina (o QA provou a combinação com Dificuldade).
+- Testes automatizados, lint e tipos: o review deu READY.
+- Questões de teste "QA LM-2889 ..." ficaram em homolog, em Rascunho.
 
 ## Detalhes técnicos
-- Review: 3 rodadas; rodada 3 READY (0 blockers, 0 should-fix, 2 nits: `?? []` inalcançável em `question-input-to-payload.ts:59` e tipo de opção repetido em `curriculum-api.ts:32`).
-- QA: APROVADO nos 9 critérios (desktop, ADMIN); Disciplina não foi combinada separadamente (depende de Matriz), Dificuldade prova a soma de filtros.
-- Commits: `feat(questions): tags no banco de questões`, `refactor(questions): QuestionTagBadges e fieldset nas tags`, `fix(questions): texto de versão...`. Commits `[kb]` removidos; a branch não toca na Base de Conhecimento.
-- Checks do front-dev: biome, tsc e vitest dos arquivos relacionados passaram.
-- Detalhes em `cards/LM-2889/implementacao.md`, `review.md` e `qa.md`.
+- QA rodada 2: APROVADO nos 9 critérios, console sem erros (`qa.md`).
+- Review rodada 3: READY, 0 blockers, 0 should-fix, 2 nits (fallback `?? []` inalcançável em `question-input-to-payload.ts:59`; tipo de opção repetido em `curriculum-api.ts:32`).
+- 3 commits na branch; sem commit `[kb]`.
+- Achado lateral, pré-existente: o diálogo de confirmação diz "questão publicada" mesmo para Rascunho.

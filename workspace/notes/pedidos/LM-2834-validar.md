@@ -1,9 +1,12 @@
 ---
 status: fechado
+pr: https://github.com/leme-tech/leme-app/pull/898
 fechado_em: 2026-11-12 17:22 (aprovado)
 card: LM-2834
 ---
 # LM-2834: validar campo "Deficiência intelectual?"
+
+**PR:** https://github.com/leme-tech/leme-app/pull/898
 
 **Preview:** http://192.168.1.173:5302/ (rede de casa, cai ao sair da validação ou após 24 h)
 

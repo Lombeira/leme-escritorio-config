@@ -1,9 +1,12 @@
 ---
 status: fechado
+pr: https://github.com/leme-tech/leme-app/pull/896
 fechado_em: 2026-11-13 12:32 (aprovado)
 card: LM-2927
 ---
 # LM-2927: o "Ajuda" abre o WhatsApp já com e-mail, cargo, escola e navegador de quem pediu
+
+**PR:** https://github.com/leme-tech/leme-app/pull/896
 
 **Abrir:** http://192.168.1.173:5301/dashboard/home?school=ebac582b-e871-4214-a916-0b38f59360ca
 **Entrar com:** a conta de teste de professor do qa.env (e a de admin para o passo 4)

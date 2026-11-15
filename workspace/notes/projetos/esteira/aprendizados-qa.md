@@ -364,3 +364,34 @@ nada novo
 - Tema escuro: `context.addInitScript` com localStorage `chakra-ui-color-mode=dark` antes da navegação (recarregar depois quebra o estado do seletor).
 - Amplitude não aparece como POST na rede do navegador; critério de evento fica por teste/código.
 - Faltou no kit: helper de "entrar no analytics da turma" e de tocar/pausar o player.
+
+## LM-2889 (14/11/2026 16:20)
+
+# Aprendizados QA LM-2889
+
+- Banco de questões: `/dashboard/mapa/questions`. `qa-scripts/lib.mjs` tem `criar(page, titulo, {erer})` que preenche o form todo (selects da matriz via react-select `#matriz-select`, `#disciplina-select`, `#learning-target-select`; `#ano-serie-select` e `#dificuldade-select` são selects nativos; 10 editores contenteditable). Reaproveitável.
+- ERER é checkbox (`getByLabel("ERER")`, usar `force: true`); select de filtro tem aria-label "Filtrar por tag"; filtro vira `?tagId=1` na URL.
+- Edição pede confirmação com "Deseja continuar" (botão Confirmar é o último do diálogo).
+- `innerText` do dialog não achou "Tags" por ordem (-1) apesar de visível; confira pelo print.
+- Contagem inicial do banco é 24 de 24, mas com busca textual a lista mostra "de 36"; o total depende dos filtros padrão.
+- Massa: questões "QA LM-2889 ..." (rodadas 1 e 2) no banco do ADMIN, reaproveitáveis.
+
+## LM-2928 (14/11/2026 16:47)
+
+# Aprendizados QA (LM-2928)
+
+- Turma de teste: Escola teste da Feda `ebac582b-e871-4214-a916-0b38f59360ca`, ano `1de13c22-759e-4d5a-9e8e-160f81c46ea4`, 1º Ano A `bc5cbf7f-6e14-4f32-ac32-39fe1a83437e` (PROFESSOR). Mapa "Trilha Teste da Feda - V2" (`17a81553...`): Linguagens 14 alunos (5/5/4 por faixa), Matemática 7 abaixo de 50%. Nenhum aluno sem nota, nenhuma habilidade com mais de 2 questões abaixo de 50% ou acima de 70% (varredura da API em qa-scripts/d8.mjs). Faltam dados para "retomar", "domina" e "quem não fez".
+- Analytics da turma: URL com school/year/class, depois clicar `[data-tour=modo-analise]`. A trilha padrão ("Trilha de Alfabetização") é vazia; trocar para "Trilha Teste da Feda - V2" no segundo seletor.
+- Player de vídeo: marcadores das cenas são botões pelo nome (Turma, Como foi, ...). Pausar e saltar deixa animações paradas (mostra "0%" ou cena vazia); espere tocando uns 4 s antes de ler/printar.
+- Visão da escola (gestão) não abre para ADMIN sem a flag: `forcarFlags(page, {"is-mapa-analytics-gestao-enabled":[{id:ESC,name:"..."}]})` (a flag não aparece em lerFlags). Abas "Turmas/Alunos/Correção/Vídeo" são texto, não role=tab.
+- Tema escuro: `context.addInitScript` com localStorage `chakra-ui-color-mode=dark` antes da navegação (recarregar depois quebra o estado do seletor).
+- Amplitude não aparece como POST na rede do navegador; critério de evento fica por teste/código.
+- Faltou no kit: helper de "entrar no analytics da turma" e de tocar/pausar o player.
+
+## Rodada 2
+- Homolog TEM massa: Escola teste da Feda, ano `1de13c22...`. 4º Ano A - Manhã `e18c4aff-d3c3-4407-b26c-549c1065b52c` (trilha "Trilha 4º Ano A - Demonstração"): Linguagens com 4+ retomar e 2 domina, Matemática com 3 retomar e 4 domina e 3 destaques. 2º Ano B - Tarde `21c90b31-9615-4c19-8d1f-a7d3473f9438`: 3 alunos sem nota ("Quem não fez"). 1º Ano D `a532f117...` com 4 abaixo de 50%. Nenhum dado foi criado.
+- PROFESSOR de teste só acessa o 1º Ano A (403 nas outras turmas); use ADMIN. ADMIN: `?school=` no reload não vale, clicar na escola, depois `[data-tour=modo-analise]`, depois escolher o cartão da turma por índice (`main button`.nth: 1ºA..D=0-3, 2ºA..C=4-6, 3º=7-9, 4ºA=10, 5º=13-15).
+- Varredura de dados pela API (ADMIN): `v2/schools`, `v2/schools/{id}/school-years`, `v2/years/{id}/classes`, `v2/learning-maps/classes/{turma}`, `v2/learning-maps/{mapa}/analytics?classId=&knowledgeGroupId=1|2`. Varrer tudo estoura 2 min: filtrar por escola e rodar em background (`nohup`) com saída em arquivo.
+- Armadilhas de shell: `pkill -f` e `pgrep -f` com o texto do script batem no próprio bash e derrubam a chamada (exit 143/144). `click().catch()` espera 30 s: use `{timeout:800}`.
+- Marcadores do player: o 1º grupo com 3+ botões é o de velocidade (1x, 1,5x, 2x); filtrar por 8+ botões e usar `aria-label`. Print com player pausado sai em branco: imprimir tocando, antes de pausar.
+- Faltou no kit: helper "ADMIN entra na turma por índice" e de marcadores do player.

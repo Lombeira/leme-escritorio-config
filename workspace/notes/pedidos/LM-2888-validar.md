@@ -1,9 +1,12 @@
 ---
 status: fechado
 fechado_em: 2026-11-13 12:28 (aprovado)
+pr: https://github.com/leme-tech/leme-app/pull/892
 card: LM-2888
 ---
 # LM-2888: novo filtro "Imagem" (com/sem imagem) no banco de itens
+
+**PR:** https://github.com/leme-tech/leme-app/pull/892
 
 **Abrir:** http://192.168.1.173:5301/dashboard/mapa/questions
 **Entrar com:** a conta de teste de ADMIN do qa.env (nunca a senha) ou a sua
